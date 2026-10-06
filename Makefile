@@ -1,7 +1,11 @@
 RACK_DIR ?= .
 RACK_EDITION := Free
 RACK_VERSION_MAJOR := 2
-RACK_VERSION ?= $(patsubst v%,%,$(shell git describe --tags --match "v$(RACK_VERSION_MAJOR).*"))
+RACK_VERSION ?= $(patsubst v%,%,$(shell git describe --tags --match "v$(RACK_VERSION_MAJOR).*" 2>/dev/null))
+# Fall back to the newest version in CHANGELOG.md when the checkout has no version tags (e.g. forks). Without a version, Core fails to load.
+ifeq ($(RACK_VERSION),)
+	RACK_VERSION := $(shell sed -n 's/^\#\#\# \($(RACK_VERSION_MAJOR)\.[0-9][0-9.]*\).*/\1/p' CHANGELOG.md | head -n 1)
+endif
 
 FLAGS += -Iinclude -Idep/include
 
