@@ -153,7 +153,7 @@ struct ChatRequest {
 struct Config {
 	std::string baseUrl = "https://openrouter.ai/api/v1";
 	std::string model = "openai/gpt-5.6-terra";
-	std::string reasoningEffort = "medium";        // off|minimal|low|medium|high
+	std::string reasoningEffort = "medium";        // off|none|minimal|low|medium|high
 	std::string reasoningParamStyle = "openrouter"; // openrouter|openai
 	int maxTokens = 0;                // <= 0: unset, not sent
 	bool hasTemperature = false;      // false: not sent
@@ -189,7 +189,7 @@ struct ResolvedKey {
 };
 /** Order: env RACK_ASSISTANT_API_KEY, env OPENROUTER_API_KEY, config.apiKey. Empty env vars are skipped. */
 ResolvedKey resolveApiKey(const Config& c);
-/** "sk-or-v1-a78c…28f6" style: first 8 chars + "…" + last 4; keys < 16 chars -> "••••". */
+/** "sk-or-v1…abcd" style: first 8 chars + "…" + last 4; keys < 16 chars -> "••••". */
 std::string maskKey(const std::string& key);
 bool isValidReasoningEffort(const std::string& s);
 bool isValidReasoningParamStyle(const std::string& s);
@@ -243,7 +243,9 @@ std::string truncateUtf8(const std::string& s, size_t maxBytes);
 Request body:
 - `model`, `messages`; `tools` + `"tool_choice": "auto"` only if `toolsJson` non-empty.
 - Reasoning: `off` → no reasoning parameter at all (for non-reasoning models).
-  Otherwise style `openrouter` → `"reasoning": {"effort": E}`; style `openai` →
+  `none` → explicit effort "none" (required by OpenAI's own API for gpt-5.6-* when tools are
+  used on /v1/chat/completions: "Function tools with reasoning_effort are not supported …
+  set reasoning_effort to 'none'"; OpenRouter accepts reasoning + tools). Otherwise style `openrouter` → `"reasoning": {"effort": E}`; style `openai` →
   `"reasoning_effort": E`.
 - `max_tokens` when set: style `openrouter` → `"max_tokens"`; style `openai` →
   `"max_completion_tokens"` (OpenAI reasoning models reject `max_tokens`).
@@ -665,7 +667,7 @@ wide): rows label + field: Base URL, Model, Reasoning effort (ChoiceButton menu:
 minimal, low, medium, high), Parameter style (openrouter, openai), Max tokens (blank =
 unset), Temperature (blank = unset), API key (`ui::PasswordField`; blank keeps the stored
 key; info line shows source + masked key, e.g. "Using env OPENROUTER_API_KEY
-(sk-or-v1-a7…28f6) — overrides the stored key"; "Clear stored key" button), Extra headers
+(sk-or-v1…abcd) — overrides the stored key"; "Clear stored key" button), Extra headers
 (multiline "Name: value" per line), Max tool rounds, Timeout (s), CA bundle, checkboxes
 Confirm destructive actions / Mock mode (no network). Buttons: Save (validates; errors in
 red; saves via `Controller::setConfig`), Cancel. Tab cycles fields (prevField/nextField).
@@ -714,3 +716,6 @@ red; saves via `Controller::setConfig`), Cancel. Tab cycles fields (prevField/ne
 6. UI strings are English like the rest of Rack; the model answers in the user's language.
 7. The panel is docked on the right (non-modal) so the rack stays usable; Ctrl+L toggles.
 8. The OpenAI `max_completion_tokens` naming is used for `reasoning_param_style: openai`.
+9. Extra effort value `none` (verified live): OpenAI direct + tools needs it. The controller
+   retries a run once with `none` when a 400 says reasoning_effort is unsupported with tools,
+   and tells the user to change the setting.
