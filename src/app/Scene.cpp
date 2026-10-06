@@ -14,6 +14,7 @@
 #include <patch.hpp>
 #include <asset.hpp>
 #include <assistant/SelfTest.hpp>
+#include <assistant/Panel.hpp>
 
 
 namespace rack {
@@ -64,6 +65,8 @@ Scene::Scene() {
 	menuBar = createMenuBar();
 	addChild(menuBar);
 
+	addChild(assistant::createPanel());
+
 	browser = browserCreate();
 	browser->hide();
 	addChild(browser);
@@ -107,6 +110,9 @@ void Scene::step() {
 	// Resize owned descendants
 	menuBar->box.size.x = box.size.x;
 	rackScroll->box.size = box.size.minus(rackScroll->box.pos);
+	// Dock the assistant panel at the right side
+	float assistantWidth = assistant::layoutPanel(math::Rect(rackScroll->box.pos, rackScroll->box.size));
+	rackScroll->box.size.x -= assistantWidth;
 
 	// Autosave periodically
 	if (settings::autosaveInterval > 0.0) {
@@ -176,6 +182,10 @@ void Scene::onHoverKey(const HoverKeyEvent& e) {
 		// DEBUG("key %d '%c' scancode %d keyName '%s' mods %02x", e.key, e.key, e.scancode, e.keyName.c_str(), e.mods);
 		if (e.isKeyCommand(GLFW_KEY_N, RACK_MOD_CTRL)) {
 			APP->patch->loadTemplateDialog();
+			e.consume(this);
+		}
+		if (e.isKeyCommand(GLFW_KEY_L, RACK_MOD_CTRL)) {
+			assistant::togglePanel();
 			e.consume(this);
 		}
 		if (e.isKeyCommand(GLFW_KEY_Q, RACK_MOD_CTRL)) {

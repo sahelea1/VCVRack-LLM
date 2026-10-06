@@ -1,13 +1,26 @@
 #include <assistant/SelfTest.hpp>
+#include <assistant/Controller.hpp>
+#include <assistant/LlmClient.hpp>
+#include <assistant/Protocol.hpp>
+#include <assistant/SystemPrompt.hpp>
+#include <assistant/SettingsDialog.hpp>
+#include <assistant/Panel.hpp>
 #include <assistant/Tools.hpp>
 #include "ToolHelpers.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #include <GLFW/glfw3.h>
 
@@ -892,6 +905,1840 @@ void toolsScenario(SelfTestRun& t) {
 }
 
 
+// ---- Mock controller scenarios (step-driven across frames) ---------------------------
+
+const double MOCK_SCENARIO_TIMEOUT_SEC = 20.0;
+
+const char* const RETRY_ERROR_BODY = R"({"error":{"message":"Function tools with reasoning_effort are not supported for gpt-5.6-terra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'."}})";
+
+
+/** Chat completion body with plain text content (no quotes or backslashes in `content`). */
+std::string chatBody(const std::string& content, const std::string& finish) {
+	return std::string("{\"model\":\"selftest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"") + content + "\"},\"finish_reason\":\"" + finish + "\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"cost\":0.0123}}";
+}
+
+
+/** What the scripted test client saw. Written by worker threads, read by the UI thread. */
+struct ClientProbe {
+	std::atomic<int> calls;
+	std::atomic<int> noneCalls;
+	std::atomic<int> lastRequestSize;
+	std::mutex mutex;
+	std::string lastModel;
+	ChatRequest first;
+
+	ClientProbe() : calls(0), noneCalls(0), lastRequestSize(0) {}
+};
+
+typedef std::function<ChatResponse(const ClientOptions&, const ChatRequest&, int)> ScriptFn;
+
+struct ScriptClient : LlmClient {
+	ClientOptions options;
+	ScriptFn fn;
+	std::shared_ptr<ClientProbe> probe;
+
+	ChatResponse complete(const ChatRequest& req, const std::atomic<bool>& cancel) override {
+		int index = probe->calls.fetch_add(1);
+		probe->lastRequestSize = (int) req.messages.size();
+		{
+			std::lock_guard<std::mutex> lock(probe->mutex);
+			if (index == 0)
+				probe->first = req;
+			probe->lastModel = options.config.model;
+		}
+		if (options.config.reasoningEffort == "none")
+			probe->noneCalls++;
+		return fn(options, req, index);
+	}
+};
+
+
+const ChatEntry* findEntryWith(Controller* c, ChatEntry::Kind kind, const std::string& sub) {
+	for (const ChatEntry& e : c->getEntries()) {
+		if (e.kind == kind && has(e.text, sub))
+			return &e;
+	}
+	return NULL;
+}
+
+int countKind(Controller* c, ChatEntry::Kind kind) {
+	int n = 0;
+	for (const ChatEntry& e : c->getEntries()) {
+		if (e.kind == kind)
+			n++;
+	}
+	return n;
+}
+
+int countRole(Controller* c, ChatMessage::Role role) {
+	int n = 0;
+	for (const ChatMessage& m : c->getMessages()) {
+		if (m.role == role)
+			n++;
+	}
+	return n;
+}
+
+const ChatEntry* lastOfKind(Controller* c, ChatEntry::Kind kind) {
+	const std::vector<ChatEntry>& es = c->getEntries();
+	for (size_t i = es.size(); i > 0; i--) {
+		if (es[i - 1].kind == kind)
+			return &es[i - 1];
+	}
+	return NULL;
+}
+
+std::string dumpEntries(Controller* c) {
+	static const char* kinds[] = {"USER", "ASSISTANT", "ACTIONS", "ERROR", "INFO", "CONFIRM"};
+	std::string s;
+	for (const ChatEntry& e : c->getEntries()) {
+		s += std::string("[") + kinds[(int) e.kind] + ": " + e.text;
+		for (const ChatEntry::Action& a : e.actions)
+			s += " {" + a.text + "}";
+		s += "] ";
+	}
+	return truncateUtf8(s, 600);
+}
+
+/** Every tool call of every assistant message must be answered by a tool message right after it. */
+bool historyValid(const std::vector<ChatMessage>& ms) {
+	for (size_t i = 0; i < ms.size(); i++) {
+		if (ms[i].role != ChatMessage::ASSISTANT)
+			continue;
+		for (const ToolCall& tc : ms[i].toolCalls) {
+			bool found = false;
+			for (size_t j = i + 1; j < ms.size() && ms[j].role == ChatMessage::TOOL; j++) {
+				if (ms[j].toolCallId == tc.id)
+					found = true;
+			}
+			if (!found)
+				return false;
+		}
+	}
+	return true;
+}
+
+bool toolMessageHas(Controller* c, const std::string& sub) {
+	for (const ChatMessage& m : c->getMessages()) {
+		if (m.role == ChatMessage::TOOL && has(m.content, sub))
+			return true;
+	}
+	return false;
+}
+
+int countModels(const std::string& plugin, const std::string& model) {
+	int n = 0;
+	for (app::ModuleWidget* mw : APP->scene->rack->getModules()) {
+		if (mw->model->plugin->slug == plugin && mw->model->slug == model)
+			n++;
+	}
+	return n;
+}
+
+/** Empties the patch with one undoable action, like a user would. */
+void prepareEmptyPatch() {
+	APP->scene->rack->deselectAll();
+	if (moduleCount() == 0)
+		return;
+	history::ComplexAction* a = new history::ComplexAction;
+	a->name = "selftest prepare";
+	ToolContext ctx;
+	ctx.undo = a;
+	defaultRegistry().execute("clear_patch", "{}", ctx);
+	if (!a->isEmpty())
+		APP->history->push(a);
+	else
+		delete a;
+}
+
+/** Adds a module through the tool registry (one undo action). Returns its id or -1. */
+int64_t addModuleDirect(const std::string& plugin, const std::string& model) {
+	history::ComplexAction* a = new history::ComplexAction;
+	a->name = "selftest add";
+	ToolContext ctx;
+	ctx.undo = a;
+	std::string args = "{\"plugin\":\"" + plugin + "\",\"model\":\"" + model + "\"}";
+	ToolResult r = defaultRegistry().execute("add_module", args, ctx);
+	int64_t id = -1;
+	json_error_t err;
+	JsonPtr j(json_loads(r.content.c_str(), 0, &err));
+	if (r.ok && j)
+		id = jint(j.get(), "module_id", -1);
+	if (!a->isEmpty())
+		APP->history->push(a);
+	else
+		delete a;
+	return id;
+}
+
+
+struct FileBackup {
+	std::string path;
+	bool existed = false;
+	std::string data;
+
+	void backup(const std::string& p) {
+		path = p;
+		std::ifstream f(path.c_str(), std::ios::in | std::ios::binary);
+		existed = (bool) f;
+		if (f) {
+			std::stringstream ss;
+			ss << f.rdbuf();
+			data = ss.str();
+		}
+	}
+	void restore() {
+		if (path.empty())
+			return;
+		if (existed) {
+			std::ofstream f(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+			f << data;
+		}
+		else {
+			std::remove(path.c_str());
+		}
+	}
+};
+
+
+struct MockScenario {
+	SelfTestRun* t = NULL;
+	Controller* c = NULL;
+	int phase = 0;
+	int phaseFrames = 0;
+	std::shared_ptr<ClientProbe> probe;
+
+	virtual ~MockScenario() {}
+	virtual const char* name() const = 0;
+	/** Adjust the config used by the dedicated controller (mock = true is preset). */
+	virtual void configure(Config& cfg) {}
+	/** Called once, after the controller exists. */
+	virtual void init() {}
+	/** Called every frame after Controller::step(). Returns true when the scenario is finished. */
+	virtual bool step() = 0;
+
+	void ck(const std::string& what, bool ok, const std::string& detail = "") {
+		t->check(std::string("mock/") + name() + ": " + what, ok, detail);
+	}
+	void next() {
+		phase++;
+		phaseFrames = 0;
+	}
+	/** Replaces the mock client by a scripted one. */
+	void useScript(ScriptFn fn) {
+		probe = std::make_shared<ClientProbe>();
+		std::shared_ptr<ClientProbe> p = probe;
+		c->setClientFactory([p, fn](const ClientOptions& o) -> std::shared_ptr<LlmClient> {
+			ScriptClient* s = new ScriptClient;
+			s->options = o;
+			s->fn = fn;
+			s->probe = p;
+			return std::shared_ptr<LlmClient>(s);
+		});
+	}
+	/** Waits for a finished run. Returns true once idle. */
+	bool idle() const {
+		return !c->isBusy();
+	}
+};
+
+
+struct PromptScenario : MockScenario {
+	const char* name() const override {
+		return "prompt";
+	}
+	bool step() override {
+		std::string def = defaultSystemPrompt();
+		ck("default prompt covers the tool workflow", has(def, "get_patch") && has(def, "search_modules") && has(def, "get_module_info") && has(def, "add_module") && has(def, "connect"));
+		ck("default prompt covers modular basics", has(def, "1 V/oct") && has(def, "gate") && has(def, "VCO") && has(def, "VCF") && has(def, "VCA") && has(def, "ADSR") && has(def, "LFO"));
+		ck("default prompt covers the genre recipes", has(def, "Tekno") && has(def, "303") && has(def, "kick") && has(def, "hoover") && has(def, "Dub delay") && has(def, "190"));
+		ck("default prompt mentions the audio interface", has(def, "audio interface"));
+		ck("default prompt has a sane size", def.size() > 3000 && def.size() < 20000, std::to_string(def.size()));
+
+		std::string env = environmentBlock();
+		ck("environment block has the version", has(env, APP_VERSION));
+		ck("environment block lists Fundamental", has(env, "Fundamental"), truncateUtf8(env, 300));
+		ck("environment block lists Core", has(env, "- Core"));
+
+		// User-editable file: created when missing, used when present, default when empty
+		std::string path = systemPromptPath();
+		std::remove(path.c_str());
+		std::string loaded = loadSystemPrompt();
+		bool created = false;
+		{
+			std::ifstream f(path.c_str(), std::ios::in | std::ios::binary);
+			std::stringstream ss;
+			ss << f.rdbuf();
+			created = (bool) f && has(ss.str(), "built-in assistant");
+		}
+		ck("loadSystemPrompt creates the file with the default", created && loaded == def);
+		{
+			std::ofstream f(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+			f << "Custom prompt for the selftest.";
+		}
+		ck("loadSystemPrompt reads the edited file", loadSystemPrompt() == "Custom prompt for the selftest.");
+		{
+			std::ofstream f(path.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+			f << "  \n";
+		}
+		ck("empty prompt file falls back to the default", loadSystemPrompt() == def);
+		std::remove(path.c_str());
+		return true;
+	}
+};
+
+
+struct BuildScenario : MockScenario {
+	const char* name() const override {
+		return "build";
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				ck("patch is empty before the run", moduleCount() == 0);
+				ck("send accepted", c->send("/mock-build", false));
+				ck("waiting for HTTP after send", c->getState() == Controller::WAITING_HTTP && c->isBusy());
+				ck("second send is rejected while busy", !c->send("another", false));
+				ck("status shows the wait", has(c->getStatusText(), "Thinking"), c->getStatusText());
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("run ends IDLE", c->getState() == Controller::IDLE);
+				ck("no error entries", countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("VCO and VCF were added", countModels("Fundamental", "VCO") >= 1 && countModels("Fundamental", "VCF") >= 1, dumpEntries(c));
+				ck("at least one cable", cableCount() >= 1);
+				int actions = 0;
+				int withText = 0;
+				for (const ChatEntry& e : c->getEntries()) {
+					if (e.kind != ChatEntry::ACTIONS)
+						continue;
+					for (const ChatEntry::Action& a : e.actions) {
+						actions++;
+						if (!a.text.empty() && a.ok)
+							withText++;
+					}
+				}
+				ck("ACTIONS entries list summaries", actions >= 5 && withText == actions, string::f("%d actions, %d ok", actions, withText));
+				const ChatEntry* fin = lastOfKind(c, ChatEntry::ASSISTANT);
+				ck("final ASSISTANT text", fin && has(fin->text, "Mock: built VCO"), dumpEntries(c));
+				ck("API history is valid", historyValid(c->getMessages()));
+				ck("status shows the last run", has(c->getStatusText(), "Last run: 5 requests"), c->getStatusText());
+				ck("revision advanced", c->getRevision() > 0);
+				ck("run recorded one undo action", APP->history->canUndo() && APP->history->getUndoName() == "assistant changes", APP->history->getUndoName());
+
+				Snapshot built = takeSnapshot();
+				APP->history->undo();
+				ck("undo once -> 0 modules", moduleCount() == 0 && APP->engine->getNumModules() == 0);
+				ck("undo once -> 0 cables", cableCount() == 0 && APP->engine->getNumCables() == 0);
+				APP->history->redo();
+				std::string d = diffSnapshots(built, takeSnapshot());
+				ck("redo restores the built patch", d.empty() && moduleCount() >= 2, d);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct DeleteScenario : MockScenario {
+	int64_t moduleId = -1;
+
+	const char* name() const override {
+		return "delete";
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				moduleId = addModuleDirect("Fundamental", "VCO");
+				ck("module added for the test", moduleId >= 0 && countModels("Fundamental", "VCO") == 1);
+				ck("send accepted", c->send("/mock-delete", false));
+				next();
+			} break;
+			case 1: {
+				if (c->getState() != Controller::WAITING_CONFIRM) {
+					if (idle()) {
+						ck("reached WAITING_CONFIRM", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				const ChatEntry* ce = lastOfKind(c, ChatEntry::CONFIRM);
+				ck("CONFIRM entry is pending", ce && ce->confirmState == ChatEntry::PENDING && has(ce->text, "Remove module"), dumpEntries(c));
+				ck("status asks for confirmation", has(c->getStatusText(), "confirmation"), c->getStatusText());
+				ck("module not removed before the answer", countModels("Fundamental", "VCO") == 1);
+				if (ce) {
+					c->confirm(ce->id + 1000, true);
+					ck("unknown entry id is ignored", c->getState() == Controller::WAITING_CONFIRM);
+					c->confirm(ce->id, false);
+				}
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				const ChatEntry* ce = lastOfKind(c, ChatEntry::CONFIRM);
+				ck("deny keeps the module", countModels("Fundamental", "VCO") == 1);
+				ck("CONFIRM entry shows DENIED", ce && ce->confirmState == ChatEntry::DENIED);
+				ck("tool result says declined", toolMessageHas(c, "declined"));
+				const ChatEntry* fin = lastOfKind(c, ChatEntry::ASSISTANT);
+				ck("run ends with a text", fin && !fin->text.empty() && countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("API history is valid", historyValid(c->getMessages()));
+				ck("answering again is ignored", (c->confirm(ce ? ce->id : 0, true), countModels("Fundamental", "VCO") == 1));
+				ck("second send accepted", c->send("/mock-delete", false));
+				next();
+			} break;
+			case 3: {
+				if (c->getState() != Controller::WAITING_CONFIRM) {
+					if (idle()) {
+						ck("reached WAITING_CONFIRM again", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				const ChatEntry* ce = lastOfKind(c, ChatEntry::CONFIRM);
+				ck("second CONFIRM entry is pending", ce && ce->confirmState == ChatEntry::PENDING);
+				if (ce)
+					c->confirm(ce->id, true);
+				next();
+			} break;
+			case 4: {
+				if (!idle())
+					return false;
+				const ChatEntry* ce = lastOfKind(c, ChatEntry::CONFIRM);
+				ck("allow removes the module", countModels("Fundamental", "VCO") == 0 && moduleCount() == 0);
+				ck("CONFIRM entry shows ALLOWED", ce && ce->confirmState == ChatEntry::ALLOWED);
+				ck("removal listed in ACTIONS", findEntryWith(c, ChatEntry::ACTIONS, "") != NULL);
+				ck("API history is valid", historyValid(c->getMessages()));
+				APP->history->undo();
+				ck("undo restores the removed module", countModels("Fundamental", "VCO") == 1);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct DeleteNoConfirmScenario : MockScenario {
+	bool sawConfirm = false;
+
+	const char* name() const override {
+		return "delete-no-confirm";
+	}
+	void configure(Config& cfg) override {
+		cfg.confirmDestructive = false;
+	}
+	bool step() override {
+		if (c->getState() == Controller::WAITING_CONFIRM)
+			sawConfirm = true;
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				ck("module added for the test", addModuleDirect("Fundamental", "VCO") >= 0);
+				ck("send accepted", c->send("/mock-delete", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("no confirmation requested", !sawConfirm && countKind(c, ChatEntry::CONFIRM) == 0);
+				ck("module removed", moduleCount() == 0);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct BadArgsScenario : MockScenario {
+	int actionIndexBefore = 0;
+
+	const char* name() const override {
+		return "badargs";
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				actionIndexBefore = APP->history->actionIndex;
+				ck("send accepted", c->send("/mock-badargs", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				bool failure = false;
+				bool short80 = true;
+				for (const ChatEntry& e : c->getEntries()) {
+					if (e.kind != ChatEntry::ACTIONS)
+						continue;
+					for (const ChatEntry::Action& a : e.actions) {
+						if (!a.ok && a.text.find("\xe2\x9c\x97 add_module: ") == 0) {
+							failure = true;
+							// "✗ add_module: " is 16 bytes; the error text is cut at ~80 bytes (+ ellipsis)
+							if (a.text.size() > 16 + 80 + 3)
+								short80 = false;
+						}
+					}
+				}
+				ck("ACTIONS contains a failure", failure, dumpEntries(c));
+				ck("failure text is short", short80);
+				const ChatEntry* fin = lastOfKind(c, ChatEntry::ASSISTANT);
+				ck("run ends with the model's text", fin && has(fin->text, "invalid arguments") && countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("tool result is an error object", toolMessageHas(c, "\"ok\":false"));
+				ck("patch unchanged", moduleCount() == 0);
+				ck("API history is valid", historyValid(c->getMessages()));
+				ck("a run without changes pushes no undo action", APP->history->actionIndex == actionIndexBefore);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct ErrorScenario : MockScenario {
+	const char* name() const override {
+		return "error-402";
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				ck("send accepted", c->send("/mock-error 402", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				const ChatEntry* e = lastOfKind(c, ChatEntry::ERROR);
+				ck("ERROR entry mentions credits", e && has(e->text, "credits"), dumpEntries(c));
+				ck("no assistant entry", countKind(c, ChatEntry::ASSISTANT) == 0);
+				ck("only the user message in the conversation", c->getMessages().size() == 1);
+				ck("status is empty after a failed run", c->getStatusText().empty(), c->getStatusText());
+				ck("a new send works after an error", c->send("hello", false));
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				const ChatEntry* e = lastOfKind(c, ChatEntry::ASSISTANT);
+				ck("reply after the error", e && has(e->text, "Mock reply: hello"), dumpEntries(c));
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct CancelScenario : MockScenario {
+	const char* name() const override {
+		return "cancel";
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				ck("send accepted", c->send("/mock-build", false));
+				ck("waiting for HTTP", c->getState() == Controller::WAITING_HTTP);
+				next();
+			} break;
+			case 1: {
+				if (phaseFrames < 2)
+					return false;
+				if (!c->isBusy()) {
+					ck("run still active after 2 frames", false, dumpEntries(c));
+					return true;
+				}
+				auto t0 = std::chrono::steady_clock::now();
+				c->cancel();
+				double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+				ck("cancel returns immediately", ms < 200.0, string::f("%.0f ms", ms));
+				ck("state is IDLE right after cancel", c->getState() == Controller::IDLE);
+				const ChatEntry* e = lastOfKind(c, ChatEntry::INFO);
+				ck("INFO Cancelled.", e && e->text == "Cancelled.", dumpEntries(c));
+				ck("no patch changes", moduleCount() == 0);
+				ck("cancel when idle is a no-op", (c->cancel(), c->getState() == Controller::IDLE && countKind(c, ChatEntry::INFO) == 1));
+				ck("a new send works right after cancel", c->send("hello", false));
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				const ChatEntry* e = lastOfKind(c, ChatEntry::ASSISTANT);
+				ck("reply after cancel", e && has(e->text, "Mock reply: hello"), dumpEntries(c));
+				ck("no stale response of the cancelled request", countKind(c, ChatEntry::ASSISTANT) == 1 && countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct CancelConfirmScenario : MockScenario {
+	const char* name() const override {
+		return "cancel-confirm";
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				ck("module added for the test", addModuleDirect("Fundamental", "VCO") >= 0);
+				ck("send accepted", c->send("/mock-delete", false));
+				next();
+			} break;
+			case 1: {
+				if (c->getState() != Controller::WAITING_CONFIRM) {
+					if (idle()) {
+						ck("reached WAITING_CONFIRM", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				c->cancel();
+				const ChatEntry* ce = lastOfKind(c, ChatEntry::CONFIRM);
+				ck("state is IDLE", c->getState() == Controller::IDLE);
+				ck("CONFIRM entry is CANCELLED", ce && ce->confirmState == ChatEntry::CANCELLED);
+				ck("INFO Cancelled.", findEntryWith(c, ChatEntry::INFO, "Cancelled.") != NULL);
+				ck("module still there", countModels("Fundamental", "VCO") == 1);
+				ck("remaining tool call got a cancelled result", toolMessageHas(c, "Cancelled by the user"));
+				ck("API history is valid", historyValid(c->getMessages()));
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct LoopScenario : MockScenario {
+	const char* name() const override {
+		return "loop";
+	}
+	void configure(Config& cfg) override {
+		cfg.maxToolRounds = 3;
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				ck("send accepted", c->send("/mock-loop", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("max-rounds INFO", findEntryWith(c, ChatEntry::INFO, "Stopped after 3 tool rounds") != NULL, dumpEntries(c));
+				ck("exactly 3 model rounds", countRole(c, ChatMessage::ASSISTANT) == 3, std::to_string(countRole(c, ChatMessage::ASSISTANT)));
+				ck("exactly 3 tool results", countRole(c, ChatMessage::TOOL) == 3);
+				ck("3 ACTIONS entries", countKind(c, ChatEntry::ACTIONS) == 3);
+				ck("API history is valid", historyValid(c->getMessages()));
+				ck("run ends IDLE", c->getState() == Controller::IDLE);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct RetryScenario : MockScenario {
+	const char* name() const override {
+		return "retry-none";
+	}
+	void init() override {
+		useScript([](const ClientOptions& o, const ChatRequest&, int) -> ChatResponse {
+			if (o.config.reasoningEffort == "none")
+				return parseResponse(200, chatBody("Retry worked.", "stop"));
+			return parseResponse(400, RETRY_ERROR_BODY);
+		});
+	}
+	bool step() override {
+		const std::string retryText = "The provider does not support reasoning together with tools for this model; retried with reasoning effort 'none'. Change it in Settings to skip the extra request.";
+		switch (phase) {
+			case 0: {
+				ck("send accepted", c->send("hello", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("INFO about the retry", findEntryWith(c, ChatEntry::INFO, retryText) != NULL, dumpEntries(c));
+				const ChatEntry* e = lastOfKind(c, ChatEntry::ASSISTANT);
+				ck("final ASSISTANT text", e && e->text == "Retry worked.", dumpEntries(c));
+				ck("no ERROR entry", countKind(c, ChatEntry::ERROR) == 0);
+				ck("exactly two requests, one with 'none'", probe->calls == 2 && probe->noneCalls == 1, string::f("%d calls, %d none", probe->calls.load(), probe->noneCalls.load()));
+				ck("usage of the successful request is summarized", c->getStatusText() == "Last run: 1 request \xc2\xb7 15 tokens \xc2\xb7 $0.0123", c->getStatusText());
+				ck("config is unchanged", c->getConfig().reasoningEffort == "medium");
+				ck("second send accepted", c->send("again", false));
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				int retries = 0;
+				for (const ChatEntry& e : c->getEntries()) {
+					if (e.kind == ChatEntry::INFO && e.text == retryText)
+						retries++;
+				}
+				ck("override applies to one run only (retried again next run)", retries == 2 && probe->calls == 4, string::f("%d retries, %d calls", retries, probe->calls.load()));
+				Config cfg = c->getConfig();
+				cfg.reasoningEffort = "off";
+				c->setConfig(cfg);
+				ck("third send accepted", c->send("third", false));
+				next();
+			} break;
+			case 3: {
+				if (!idle())
+					return false;
+				const ChatEntry* e = lastOfKind(c, ChatEntry::ERROR);
+				ck("effort 'off' is not retried: error shown", e && has(e->text, "rejected the request") && probe->calls == 5, dumpEntries(c));
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct LengthScenario : MockScenario {
+	const char* name() const override {
+		return "length";
+	}
+	void init() override {
+		useScript([](const ClientOptions&, const ChatRequest&, int) -> ChatResponse {
+			return parseResponse(200, chatBody("Partial text", "length"));
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				ck("send accepted", c->send("hello", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("partial text shown", findEntryWith(c, ChatEntry::ASSISTANT, "Partial text") != NULL);
+				ck("INFO cut off", findEntryWith(c, ChatEntry::INFO, "The response was cut off (max_tokens).") != NULL, dumpEntries(c));
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct EmptyReplyScenario : MockScenario {
+	const char* name() const override {
+		return "empty-reply";
+	}
+	void init() override {
+		useScript([](const ClientOptions&, const ChatRequest&, int) -> ChatResponse {
+			return parseResponse(200, chatBody("", "stop"));
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				ck("send accepted", c->send("hello", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("INFO empty reply", findEntryWith(c, ChatEntry::INFO, "The model returned an empty reply.") != NULL, dumpEntries(c));
+				ck("no assistant entry", countKind(c, ChatEntry::ASSISTANT) == 0 && countKind(c, ChatEntry::ERROR) == 0);
+				ck("empty reply not kept in the conversation", c->getMessages().size() == 1);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct NewChatScenario : MockScenario {
+	const char* name() const override {
+		return "new-chat";
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				ck("send accepted", c->send("hello", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("entries and messages exist", c->getEntries().size() >= 2 && c->getMessages().size() >= 2);
+				uint64_t rev = c->getRevision();
+				uint64_t lastId = c->getEntries().back().id;
+				c->newChat();
+				ck("newChat clears entries and messages", c->getEntries().empty() && c->getMessages().empty());
+				ck("newChat bumps the revision", c->getRevision() > rev);
+				ck("state IDLE", c->getState() == Controller::IDLE);
+				ck("status empty", c->getStatusText().empty(), c->getStatusText());
+				// Entry ids keep increasing across chats
+				ck("send after newChat", c->send("again", false));
+				ck("entry ids stay unique", c->getEntries().back().id > lastId);
+				c->newChat();
+				ck("newChat while busy cancels and clears", c->getState() == Controller::IDLE && c->getEntries().empty() && c->getMessages().empty());
+				ck("send after busy newChat", c->send("hi", false));
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				ck("fresh conversation", c->getEntries().size() == 2 && c->getMessages().size() == 2 && countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct SelectionScenario : MockScenario {
+	int64_t moduleId = -1;
+
+	const char* name() const override {
+		return "attach-selection";
+	}
+	bool step() override {
+		app::RackWidget* rack = APP->scene->rack;
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				moduleId = addModuleDirect("Fundamental", "VCO");
+				app::ModuleWidget* mw = rack->getModule(moduleId);
+				ck("module added", mw != NULL);
+				if (!mw)
+					return true;
+				rack->select(mw, true);
+				ck("module selected", rack->hasSelection());
+				ck("send accepted", c->send("hello", true));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				std::string content = c->getMessages().empty() ? "" : c->getMessages()[0].content;
+				ck("USER message has the selection block", has(content, "[Selected modules]"), content);
+				ck("block names the module id", has(content, string::f("id %lld:", (long long) moduleId)) && has(content, "Fundamental/VCO"), content);
+				ck("block keeps the user text first", content.find("hello") == 0);
+				const ChatEntry* e = findEntryWith(c, ChatEntry::USER, "hello");
+				ck("USER entry shows only the text and a note", e && !has(e->text, "[Selected modules]") && has(e->text, "(+1 selected module attached)"), e ? e->text : "");
+				ck("send without attachment", c->send("second", false));
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				std::string last;
+				for (const ChatMessage& m : c->getMessages()) {
+					if (m.role == ChatMessage::USER)
+						last = m.content;
+				}
+				ck("no block when attachSelection is false", last == "second", last);
+				rack->deselectAll();
+				ck("send with attachment but nothing selected", c->send("third", true));
+				next();
+			} break;
+			case 3: {
+				if (!idle())
+					return false;
+				std::string last;
+				for (const ChatMessage& m : c->getMessages()) {
+					if (m.role == ChatMessage::USER)
+						last = m.content;
+				}
+				ck("no block when nothing is selected", last == "third", last);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct TrimScenario : MockScenario {
+	const char* name() const override {
+		return "trim-context";
+	}
+	void configure(Config& cfg) override {
+		cfg.maxContextChars = 1000;
+	}
+	void init() override {
+		useScript([](const ClientOptions&, const ChatRequest&, int) -> ChatResponse {
+			return parseResponse(200, chatBody("ok", "stop"));
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				ck("send accepted", c->send("first", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("single turn is never dropped", probe->lastRequestSize == 2, std::to_string(probe->lastRequestSize.load()));
+				ck("second send accepted", c->send("second", false));
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				ck("oldest turn dropped from the request (system + latest user)", probe->lastRequestSize == 2, std::to_string(probe->lastRequestSize.load()));
+				ck("conversation itself is kept", c->getMessages().size() == 4);
+				ck("INFO about trimming", findEntryWith(c, ChatEntry::INFO, "Older messages") != NULL, dumpEntries(c));
+				bool systemFirst, hasTools;
+				{
+					std::lock_guard<std::mutex> lock(probe->mutex);
+					systemFirst = !probe->first.messages.empty() && probe->first.messages[0].role == ChatMessage::SYSTEM && has(probe->first.messages[0].content, "built-in assistant") && has(probe->first.messages[0].content, "# Environment");
+					hasTools = has(probe->first.toolsJson, "get_patch") && has(probe->first.toolsJson, "clear_patch");
+				}
+				ck("request starts with the system prompt + environment", systemFirst);
+				ck("request carries the tool definitions", hasTools);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+struct ConfigScenario : MockScenario {
+	const char* name() const override {
+		return "config";
+	}
+	void init() override {
+		useScript([](const ClientOptions&, const ChatRequest&, int) -> ChatResponse {
+			return parseResponse(200, chatBody("ok", "stop"));
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				Config cfg = c->getConfig();
+				cfg.maxToolRounds = 1000;
+				std::string err;
+				ck("setConfig saves", c->setConfig(cfg, &err), err);
+				ck("setConfig applies clamped values", c->getConfig().maxToolRounds == 100);
+				Config disk = loadConfig(configPath());
+				ck("setConfig wrote assistant.json", disk.maxToolRounds == 100 && disk.mock);
+
+				// External edit applies at the next send
+				Config ext = c->getConfig();
+				ext.model = "selftest/external-model";
+				saveConfig(ext, configPath());
+				ck("send accepted", c->send("hello", false));
+				ck("send reloads assistant.json", c->getConfig().model == "selftest/external-model", c->getConfig().model);
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				std::string model;
+				{
+					std::lock_guard<std::mutex> lock(probe->mutex);
+					model = probe->lastModel;
+				}
+				ck("client created with the reloaded config", model == "selftest/external-model", model);
+
+				// A broken file keeps the current config and tells the user
+				{
+					std::ofstream f(configPath().c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+					f << "{not json";
+				}
+				ck("send accepted", c->send("again", false));
+				ck("broken file keeps the previous settings", c->getConfig().model == "selftest/external-model");
+				ck("INFO about the broken file", findEntryWith(c, ChatEntry::INFO, "Keeping the previous settings") != NULL, dumpEntries(c));
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				ck("run with a broken file still works", countKind(c, ChatEntry::ASSISTANT) == 2 && countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+// ---- Scripted run scenarios (history / patch replacement) ----------------------------
+
+/** Shared between a scripted client (worker thread) and its scenario (UI thread). */
+struct GateState {
+	/** The script blocks in its gated round until gate >= 1 */
+	std::atomic<int> gate;
+	/** Set by the script while it blocks */
+	std::atomic<int> waiting;
+	GateState() : gate(0), waiting(0) {}
+};
+
+std::string jsonEscapeForSelfTest(const std::string& s) {
+	std::string o;
+	for (char ch : s) {
+		if (ch == '"' || ch == '\\')
+			o += '\\';
+		o += ch;
+	}
+	return o;
+}
+
+/** Chat completion body with one tool call. `argsJson` is the raw arguments object text. */
+std::string toolCallBody(const std::string& id, const std::string& name, const std::string& argsJson) {
+	return std::string("{\"model\":\"selftest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"") + id
+		+ "\",\"type\":\"function\",\"function\":{\"name\":\"" + name + "\",\"arguments\":\"" + jsonEscapeForSelfTest(argsJson)
+		+ "\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}";
+}
+
+std::string addModuleArgs(const std::string& model) {
+	return "{\"plugin\":\"Fundamental\",\"model\":\"" + model + "\"}";
+}
+
+/** Text of the last USER message and the number of TOOL results after it (= the round of the run). */
+void scriptPosition(const ChatRequest& req, std::string* tag, int* round) {
+	*tag = "";
+	*round = 0;
+	for (size_t i = req.messages.size(); i > 0; i--) {
+		const ChatMessage& m = req.messages[i - 1];
+		if (m.role == ChatMessage::USER) {
+			*tag = m.content;
+			return;
+		}
+		if (m.role == ChatMessage::TOOL)
+			(*round)++;
+	}
+}
+
+void waitGate(const std::shared_ptr<GateState>& g) {
+	g->waiting = 1;
+	for (int i = 0; i < 30000 && g->gate.load() < 1; i++)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+struct GatedScenario : MockScenario {
+	std::shared_ptr<GateState> gs = std::make_shared<GateState>();
+	int baseIndex = 0;
+
+	~GatedScenario() override {
+		// Never leave the worker blocked
+		gs->gate = 1000;
+	}
+	/** Blocks the next gated round again */
+	void arm() {
+		gs->waiting = 0;
+		gs->gate = 0;
+	}
+	void release() {
+		gs->gate = 1;
+	}
+	bool blocked() const {
+		return gs->waiting.load() == 1 && c->getState() == Controller::WAITING_HTTP;
+	}
+};
+
+
+/** A user edit that happens while the run waits for the model must end up after the run's partial action in the history,
+and the next mutation of the run must go into a NEW action after it. */
+struct HistoryOrderScenario : GatedScenario {
+	const char* name() const override {
+		return "history-order";
+	}
+	void init() override {
+		std::shared_ptr<GateState> g = gs;
+		useScript([g](const ClientOptions&, const ChatRequest& req, int) -> ChatResponse {
+			std::string tag;
+			int round;
+			scriptPosition(req, &tag, &round);
+			if (round == 0)
+				return parseResponse(200, toolCallBody("c0", "add_module", addModuleArgs("VCO")));
+			waitGate(g);
+			return parseResponse(200, chatBody("done", "stop"));
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				baseIndex = APP->history->actionIndex;
+				ck("send accepted", c->send("go", false));
+				next();
+			} break;
+			case 1: {
+				if (!blocked()) {
+					if (idle()) {
+						ck("run reached the gated round", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				ck("VCO added", countModels("Fundamental", "VCO") == 1);
+				ck("the run's action is already in the history while the run waits", APP->history->actionIndex == baseIndex + 1 && APP->history->getUndoName() == "assistant changes", APP->history->getUndoName());
+				ck("user edit during the run", addModuleDirect("Fundamental", "LFO") >= 0);
+				ck("user edit is on top of the run's action", APP->history->actionIndex == baseIndex + 2 && APP->history->getUndoName() == "selftest add");
+				release();
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				ck("run finished without errors", countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("history order is chronological", APP->history->actionIndex == baseIndex + 2 && (int) APP->history->actions.size() == baseIndex + 2
+					&& APP->history->actions[baseIndex]->name == "assistant changes" && APP->history->actions[baseIndex + 1]->name == "selftest add");
+				APP->history->undo();
+				ck("first undo removes the user's module only", countModels("Fundamental", "LFO") == 0 && countModels("Fundamental", "VCO") == 1);
+				APP->history->undo();
+				ck("second undo removes the run's module", countModels("Fundamental", "VCO") == 0);
+				APP->history->redo();
+				APP->history->redo();
+				ck("redo restores both", countModels("Fundamental", "LFO") == 1 && countModels("Fundamental", "VCO") == 1);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+/** Undo while the run waits reverts the run's partial changes; later tool calls start a new action without touching freed memory. */
+struct UndoDuringRunScenario : GatedScenario {
+	const char* name() const override {
+		return "undo-during-run";
+	}
+	void init() override {
+		std::shared_ptr<GateState> g = gs;
+		useScript([g](const ClientOptions&, const ChatRequest& req, int) -> ChatResponse {
+			std::string tag;
+			int round;
+			scriptPosition(req, &tag, &round);
+			if (round == 0)
+				return parseResponse(200, toolCallBody("c0", "add_module", addModuleArgs("VCO")));
+			if (round == 1) {
+				waitGate(g);
+				return parseResponse(200, toolCallBody("c1", "add_module", addModuleArgs("VCF")));
+			}
+			return parseResponse(200, chatBody("done", "stop"));
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				baseIndex = APP->history->actionIndex;
+				ck("send accepted", c->send("go", false));
+				next();
+			} break;
+			case 1: {
+				if (!blocked()) {
+					if (idle()) {
+						ck("run reached the gated round", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				ck("VCO added", countModels("Fundamental", "VCO") == 1);
+				APP->history->undo();
+				ck("undo during the run reverts the run's changes", countModels("Fundamental", "VCO") == 0 && moduleCount() == 0);
+				release();
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				ck("run finished without errors", countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("later tool call still ran", countModels("Fundamental", "VCF") == 1 && countModels("Fundamental", "VCO") == 0);
+				ck("new action replaced the undone one", APP->history->actionIndex == baseIndex + 1 && (int) APP->history->actions.size() == baseIndex + 1
+					&& APP->history->getUndoName() == "assistant changes");
+				APP->history->undo();
+				ck("undo reverts the second part", moduleCount() == 0);
+				APP->history->redo();
+				ck("redo brings it back", countModels("Fundamental", "VCF") == 1);
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+/** New/Open/Revert during a run cancels it and keeps the run's old actions out of the new patch's history. */
+struct PatchReplacedScenario : GatedScenario {
+	const char* name() const override {
+		return "patch-replaced";
+	}
+	void init() override {
+		std::shared_ptr<GateState> g = gs;
+		useScript([g](const ClientOptions&, const ChatRequest& req, int) -> ChatResponse {
+			std::string tag;
+			int round;
+			scriptPosition(req, &tag, &round);
+			if (round == 0)
+				return parseResponse(200, toolCallBody("c0", "add_module", addModuleArgs("VCO")));
+			if (has(tag, "confirm")) {
+				if (round == 1)
+					return parseResponse(200, toolCallBody("c1", "clear_patch", "{}"));
+				return parseResponse(200, chatBody("done", "stop"));
+			}
+			if (round == 1) {
+				waitGate(g);
+				return parseResponse(200, toolCallBody("c1", "add_module", addModuleArgs("VCF")));
+			}
+			return parseResponse(200, chatBody("done", "stop"));
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				ck("send accepted", c->send("go", false));
+				next();
+			} break;
+			case 1: {
+				if (!blocked()) {
+					if (idle()) {
+						ck("run reached the gated round", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				ck("VCO added", countModels("Fundamental", "VCO") == 1 && APP->history->canUndo());
+				APP->patch->clear();
+				ck("patch cleared", moduleCount() == 0 && !APP->history->canUndo());
+				release();
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				ck("run was cancelled because of the new patch", findEntryWith(c, ChatEntry::INFO, "the patch was replaced") != NULL, dumpEntries(c));
+				ck("the model's late answer was not executed", moduleCount() == 0);
+				ck("the new patch has an empty history", !APP->history->canUndo() && !APP->history->canRedo());
+				ck("API history is valid", historyValid(c->getMessages()));
+				ck("send works afterwards", c->send("confirm", false));
+				next();
+			} break;
+			case 3: {
+				if (c->getState() != Controller::WAITING_CONFIRM) {
+					if (idle()) {
+						ck("reached WAITING_CONFIRM", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				const ChatEntry* ce = lastOfKind(c, ChatEntry::CONFIRM);
+				ck("clear_patch asks for confirmation", ce && ce->confirmState == ChatEntry::PENDING, dumpEntries(c));
+				APP->patch->clear();
+				int64_t lfo = addModuleDirect("Fundamental", "LFO");
+				ck("another patch with a module", lfo >= 0 && moduleCount() == 1);
+				if (ce)
+					c->confirm(ce->id, true);
+				ck("a stale answer does not resume the run", c->getState() == Controller::WAITING_CONFIRM);
+				next();
+			} break;
+			case 4: {
+				if (!idle())
+					return false;
+				const ChatEntry* ce = lastOfKind(c, ChatEntry::CONFIRM);
+				ck("CONFIRM entry is CANCELLED", ce && ce->confirmState == ChatEntry::CANCELLED);
+				ck("the stale clear_patch did not run", countModels("Fundamental", "LFO") == 1 && moduleCount() == 1);
+				ck("history holds only the new patch's own action", APP->history->actions.size() == 1 && APP->history->getUndoName() == "selftest add");
+				ck("API history is valid", historyValid(c->getMessages()));
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+/** The patch counts as saved only if it matches the saved file. */
+struct SavedStateScenario : GatedScenario {
+	std::string dir = "assistant-selftest-saved";
+	std::string file;
+
+	const char* name() const override {
+		return "saved-state";
+	}
+	void init() override {
+		file = system::join(asset::user("patches"), dir + "/saved.vcv");
+		std::shared_ptr<GateState> g = gs;
+		std::string path = dir + "/saved.vcv";
+		useScript([g, path](const ClientOptions&, const ChatRequest& req, int) -> ChatResponse {
+			std::string tag;
+			int round;
+			scriptPosition(req, &tag, &round);
+			if (round == 0)
+				return parseResponse(200, toolCallBody("c0", "add_module", addModuleArgs("VCO")));
+			if (round == 1)
+				return parseResponse(200, toolCallBody("c1", "save_patch", "{\"path\":\"" + path + "\"}"));
+			if (has(tag, "more")) {
+				// save, then change the patch again
+				if (round == 2)
+					return parseResponse(200, toolCallBody("c2", "add_module", addModuleArgs("VCF")));
+			}
+			else if (has(tag, "wait")) {
+				if (round == 2) {
+					waitGate(g);
+					return parseResponse(200, chatBody("done", "stop"));
+				}
+			}
+			return parseResponse(200, chatBody("done", "stop"));
+		});
+	}
+	~SavedStateScenario() override {
+		system::removeRecursively(system::join(asset::user("patches"), dir));
+		APP->patch->path = "";
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				prepareEmptyPatch();
+				ck("send accepted", c->send("plain", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("save_patch worked", system::exists(file) && countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("patch is saved after add + save", APP->history->isSaved());
+				ck("send accepted", c->send("wait", false));
+				next();
+			} break;
+			case 2: {
+				if (!blocked()) {
+					if (idle()) {
+						ck("run reached the gated round", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				ck("saved while the run waits", APP->history->isSaved());
+				ck("user edit during the run", addModuleDirect("Fundamental", "LFO") >= 0);
+				release();
+				next();
+			} break;
+			case 3: {
+				if (!idle())
+					return false;
+				ck("a user edit after save_patch leaves the patch unsaved", !APP->history->isSaved());
+				arm();
+				ck("send accepted", c->send("more", false));
+				next();
+			} break;
+			case 4: {
+				if (!idle())
+					return false;
+				ck("mutation after save_patch leaves the patch unsaved", !APP->history->isSaved(), dumpEntries(c));
+				APP->history->undo();
+				ck("undoing the run does not claim the patch is saved", !APP->history->isSaved());
+				APP->history->redo();
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+/** Edge cases of the run's undo action while the run waits: redo of the run's action and the 500-action history cap. */
+struct HistoryEdgeScenario : GatedScenario {
+	const char* name() const override {
+		return "history-edge";
+	}
+	void init() override {
+		std::shared_ptr<GateState> g = gs;
+		useScript([g](const ClientOptions&, const ChatRequest& req, int) -> ChatResponse {
+			std::string tag;
+			int round;
+			scriptPosition(req, &tag, &round);
+			if (round == 0)
+				return parseResponse(200, toolCallBody("c0", "add_module", addModuleArgs("VCO")));
+			if (round == 1) {
+				waitGate(g);
+				return parseResponse(200, toolCallBody("c1", "add_module", addModuleArgs("VCF")));
+			}
+			return parseResponse(200, chatBody("done", "stop"));
+		});
+	}
+	static void pushFillers(int n) {
+		for (int i = 0; i < n; i++) {
+			history::ComplexAction* a = new history::ComplexAction;
+			a->name = "selftest filler";
+			APP->history->push(a);
+		}
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				APP->patch->clear();
+				prepareEmptyPatch();
+				baseIndex = APP->history->actionIndex;
+				ck("send accepted", c->send("redo", false));
+				next();
+			} break;
+			case 1: {
+				if (!blocked()) {
+					if (idle()) {
+						ck("run reached the gated round", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				APP->history->undo();
+				ck("user undid the run's action", countModels("Fundamental", "VCO") == 0);
+				next();
+			} break;
+			case 2: {
+				// One frame later the controller has noticed the undo
+				if (phaseFrames++ < 2)
+					return false;
+				APP->history->redo();
+				ck("user redid the run's action", countModels("Fundamental", "VCO") == 1);
+				release();
+				next();
+			} break;
+			case 3: {
+				if (!idle())
+					return false;
+				ck("run finished without errors", countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("both modules exist", countModels("Fundamental", "VCO") == 1 && countModels("Fundamental", "VCF") == 1);
+				ck("history is consistent (no stale pointers)", APP->history->actionIndex == (int) APP->history->actions.size() && APP->history->actionIndex >= baseIndex + 1);
+				APP->history->undo();
+				APP->history->undo();
+				APP->history->redo();
+				APP->history->redo();
+				ck("undo/redo still works", countModels("Fundamental", "VCO") == 1 && countModels("Fundamental", "VCF") == 1);
+				arm();
+				ck("send accepted", c->send("cap", false));
+				next();
+			} break;
+			case 4: {
+				if (!blocked()) {
+					if (idle()) {
+						ck("run reached the gated round", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				ck("VCO added by the second run", countModels("Fundamental", "VCO") == 2);
+				// 500 user actions push the run's action out of the history
+				pushFillers(500);
+				ck("history is capped at 500", APP->history->actions.size() == 500);
+				release();
+				next();
+			} break;
+			case 5: {
+				if (!idle())
+					return false;
+				ck("run finished without errors", countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("later mutation ran after the cap trimmed the run's action", countModels("Fundamental", "VCF") == 2);
+				ck("it is in a new action at the top", APP->history->actionIndex == 500 && APP->history->getUndoName() == "assistant changes");
+				ck("history stayed capped", APP->history->actions.size() == 500);
+				// The run's first action was trimmed away, so one undo step cannot revert the whole run: no partial "Undo changes"
+				ck("a run split by the history cap offers no undoLastRun", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undoLastRun is a no-op for a split run", countModels("Fundamental", "VCF") == 2 && countModels("Fundamental", "VCO") == 2);
+				APP->patch->clear();
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+/** canUndoLastRun() / undoLastRun() semantics. */
+struct UndoLastRunScenario : GatedScenario {
+	const char* name() const override {
+		return "undo-last-run";
+	}
+	void init() override {
+		std::shared_ptr<GateState> g = gs;
+		useScript([g](const ClientOptions&, const ChatRequest& req, int) -> ChatResponse {
+			std::string tag;
+			int round;
+			scriptPosition(req, &tag, &round);
+			if (tag == "text")
+				return parseResponse(200, chatBody("just text", "stop"));
+			if (round == 0)
+				return parseResponse(200, toolCallBody("c0", "add_module", addModuleArgs("VCO")));
+			if (tag == "two" && round == 1)
+				return parseResponse(200, toolCallBody("c1", "add_module", addModuleArgs("VCF")));
+			if (tag == "gsplit" && round == 1) {
+				waitGate(g);
+				return parseResponse(200, toolCallBody("c1", "add_module", addModuleArgs("VCF")));
+			}
+			if (tag == "gate" && round == 1)
+				waitGate(g);
+			return parseResponse(200, chatBody("done", "stop"));
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				// The previous scenario left a full (500 actions) history behind
+				APP->patch->clear();
+				prepareEmptyPatch();
+				baseIndex = APP->history->actionIndex;
+				ck("nothing to undo before any run", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undoLastRun without a run is a no-op", APP->history->actionIndex == baseIndex);
+				ck("send accepted", c->send("one", false));
+				ck("false while busy", !c->canUndoLastRun());
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("VCO added", countModels("Fundamental", "VCO") == 1);
+				ck("can undo the finished run", c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undoLastRun reverted the run in one step", moduleCount() == 0 && APP->history->actionIndex == baseIndex, string::f("modules %d idx %d base %d", (int) moduleCount(), APP->history->actionIndex, baseIndex));
+				ck("the button state is gone after the undo", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("a second undoLastRun is a no-op", APP->history->actionIndex == baseIndex && moduleCount() == 0);
+				ck("send accepted", c->send("two", false));
+				next();
+			} break;
+			case 2: {
+				if (!idle())
+					return false;
+				ck("two modules added by one run", countModels("Fundamental", "VCO") == 1 && countModels("Fundamental", "VCF") == 1 && APP->history->actionIndex == baseIndex + 1);
+				ck("can undo", c->canUndoLastRun());
+				ck("user edit after the run", addModuleDirect("Fundamental", "LFO") >= 0);
+				ck("a user edit disables undoLastRun", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undoLastRun does nothing then", moduleCount() == 3);
+				APP->history->undo();
+				ck("user undid own edit", moduleCount() == 2);
+				ck("run's action is the newest undo step again", c->canUndoLastRun());
+				c->undoLastRun();
+				ck("whole run reverted", moduleCount() == 0 && APP->history->actionIndex == baseIndex);
+				ck("send accepted", c->send("one", false));
+				next();
+			} break;
+			case 3: {
+				if (!idle())
+					return false;
+				ck("run added a module", moduleCount() == 1 && c->canUndoLastRun());
+				ck("send accepted", c->send("text", false));
+				next();
+			} break;
+			case 4: {
+				if (!idle())
+					return false;
+				ck("a later run without changes forgets the earlier one", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undoLastRun is a no-op", moduleCount() == 1);
+				arm();
+				ck("send accepted", c->send("gate", false));
+				next();
+			} break;
+			case 5: {
+				if (!blocked()) {
+					if (idle()) {
+						ck("run reached the gated round", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				ck("VCO added", moduleCount() == 2);
+				ck("busy: cannot undo", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("busy: undoLastRun is a no-op", moduleCount() == 2);
+				release();
+				next();
+			} break;
+			case 6: {
+				if (!idle())
+					return false;
+				ck("can undo after the gated run", c->canUndoLastRun());
+				APP->patch->clear();
+				ck("patch cleared", moduleCount() == 0);
+				ck("a cleared patch disables undoLastRun", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undoLastRun after clear is safe", moduleCount() == 0 && !APP->history->canUndo());
+				ck("send accepted", c->send("one", false));
+				next();
+			} break;
+			case 7: {
+				if (!idle())
+					return false;
+				ck("run in the new patch", moduleCount() == 1 && c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undo works in the new patch", moduleCount() == 0);
+				ck("send accepted", c->send("one", false));
+				next();
+			} break;
+			case 8: {
+				if (!idle())
+					return false;
+				ck("can undo", c->canUndoLastRun());
+				// Replace the run's action by an unrelated one of the same history position (new allocation)
+				APP->history->undo();
+				ck("user undo", moduleCount() == 0 && !c->canUndoLastRun());
+				history::ComplexAction* a = new history::ComplexAction;
+				a->name = "selftest other";
+				APP->history->push(a);
+				ck("a new action at the same history position is not the run's action", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undoLastRun leaves it alone", APP->history->getUndoName() == "selftest other" && APP->history->actionIndex == 1);
+				APP->patch->clear();
+				prepareEmptyPatch();
+				arm();
+				ck("send accepted", c->send("gsplit", false));
+				next();
+			} break;
+			case 9: {
+				if (!blocked()) {
+					if (idle()) {
+						ck("run reached the gated round", false, dumpEntries(c));
+						return true;
+					}
+					return false;
+				}
+				ck("VCO added", countModels("Fundamental", "VCO") == 1);
+				// The user edits the patch between two mutating calls of the run: the run ends up with two undo steps
+				ck("user edit while the run waits", addModuleDirect("Fundamental", "LFO") >= 0);
+				release();
+				next();
+			} break;
+			case 10: {
+				if (!idle())
+					return false;
+				ck("run finished without errors", countKind(c, ChatEntry::ERROR) == 0, dumpEntries(c));
+				ck("all three modules exist", moduleCount() == 3 && countModels("Fundamental", "VCF") == 1);
+				ck("a run split by a user edit offers no partial undo", !c->canUndoLastRun());
+				c->undoLastRun();
+				ck("undoLastRun is a no-op for a split run", moduleCount() == 3);
+				APP->patch->clear();
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+
+/** While the modal settings dialog is open, no key may reach the Scene (undo, redo, delete selection, open, new, ...). Keys are injected through the real event dispatch. */
+struct SettingsKeysScenario : MockScenario {
+	size_t sceneChildren = 0;
+	int historyIndex = 0;
+	size_t modules = 0;
+
+	const char* name() const override {
+		return "settings-keys";
+	}
+	static void key(int k, int mods) {
+		math::Vec pos = APP->scene->box.size.div(2.f);
+		APP->event->handleKey(pos, k, 0, GLFW_PRESS, mods);
+		APP->event->handleKey(pos, k, 0, GLFW_RELEASE, mods);
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				APP->patch->clear();
+				int64_t id = addModuleDirect("Fundamental", "VCO");
+				ck("module added", id >= 0 && moduleCount() == 1);
+				APP->scene->rack->selectAll();
+				ck("module selected", APP->scene->rack->hasSelection());
+				modules = moduleCount();
+				historyIndex = APP->history->actionIndex;
+				sceneChildren = APP->scene->children.size();
+				showSettingsDialog(c);
+				ck("dialog was added to the scene", APP->scene->children.size() == sceneChildren + 1);
+				ck("a field has the keyboard focus", APP->event->selectedWidget != NULL);
+				next();
+			} break;
+			case 1: {
+				if (phaseFrames++ < 3)
+					return false;
+				// Keys with a text field focused
+				key(GLFW_KEY_Z, GLFW_MOD_CONTROL);
+				key(GLFW_KEY_Z, GLFW_MOD_CONTROL | GLFW_MOD_SHIFT);
+				key(GLFW_KEY_Y, GLFW_MOD_CONTROL);
+				key(GLFW_KEY_BACKSPACE, 0);
+				key(GLFW_KEY_DELETE, 0);
+				key(GLFW_KEY_D, GLFW_MOD_CONTROL);
+				key(GLFW_KEY_E, GLFW_MOD_CONTROL);
+				key(GLFW_KEY_F11, 0);
+				key(GLFW_KEY_L, GLFW_MOD_CONTROL);
+				ck("the patch is untouched by keys in a field", moduleCount() == modules && APP->history->actionIndex == historyIndex);
+				ck("the panel was not toggled by Ctrl+L", !isPanelHiddenToggled());
+				// Keys when the focus is on a widget that does not handle keys: clicks move it to the dialog
+				APP->event->setSelectedWidget(NULL);
+				next();
+			} break;
+			case 2: {
+				if (phaseFrames++ < 3)
+					return false;
+				ck("focus returns into the dialog", APP->event->selectedWidget != NULL);
+				key(GLFW_KEY_Z, GLFW_MOD_CONTROL);
+				key(GLFW_KEY_BACKSPACE, 0);
+				key(GLFW_KEY_DELETE, 0);
+				ck("the patch is untouched by keys on the dialog", moduleCount() == modules && APP->history->actionIndex == historyIndex);
+				// Escape closes the dialog
+				key(GLFW_KEY_ESCAPE, 0);
+				next();
+			} break;
+			case 3: {
+				if (phaseFrames++ < 3)
+					return false;
+				ck("Escape closed the dialog", APP->scene->children.size() == sceneChildren);
+				ck("the patch is still untouched", moduleCount() == modules && APP->history->actionIndex == historyIndex);
+				// Without the dialog the same shortcut works again
+				APP->scene->rack->deselectAll();
+				key(GLFW_KEY_Z, GLFW_MOD_CONTROL);
+				ck("Ctrl+Z works after the dialog is closed", moduleCount() == 0);
+				return true;
+			}
+		}
+		return false;
+	}
+	bool isPanelHiddenToggled() {
+		// The panel is hidden in the selftest run and must stay so
+		return isPanelVisible();
+	}
+};
+
+
+struct MockRunner {
+	typedef MockScenario* (*Factory)();
+
+	std::vector<Factory> factories;
+	size_t index = 0;
+	std::unique_ptr<MockScenario> current;
+	std::unique_ptr<Controller> controller;
+	std::chrono::steady_clock::time_point scenarioStart;
+	FileBackup configBackup;
+	FileBackup promptBackup;
+	bool started = false;
+
+	template <class T>
+	static MockScenario* make() {
+		return new T;
+	}
+
+	MockRunner() {
+		factories.push_back(&make<PromptScenario>);
+		factories.push_back(&make<BuildScenario>);
+		factories.push_back(&make<DeleteScenario>);
+		factories.push_back(&make<DeleteNoConfirmScenario>);
+		factories.push_back(&make<BadArgsScenario>);
+		factories.push_back(&make<ErrorScenario>);
+		factories.push_back(&make<CancelScenario>);
+		factories.push_back(&make<CancelConfirmScenario>);
+		factories.push_back(&make<LoopScenario>);
+		factories.push_back(&make<RetryScenario>);
+		factories.push_back(&make<LengthScenario>);
+		factories.push_back(&make<EmptyReplyScenario>);
+		factories.push_back(&make<NewChatScenario>);
+		factories.push_back(&make<SelectionScenario>);
+		factories.push_back(&make<TrimScenario>);
+		factories.push_back(&make<ConfigScenario>);
+		factories.push_back(&make<HistoryOrderScenario>);
+		factories.push_back(&make<UndoDuringRunScenario>);
+		factories.push_back(&make<PatchReplacedScenario>);
+		factories.push_back(&make<SavedStateScenario>);
+		factories.push_back(&make<HistoryEdgeScenario>);
+		factories.push_back(&make<UndoLastRunScenario>);
+		factories.push_back(&make<SettingsKeysScenario>);
+	}
+
+	~MockRunner() {
+		finishAll();
+	}
+
+	void finishAll() {
+		current.reset();
+		controller.reset();
+		if (started) {
+			configBackup.restore();
+			promptBackup.restore();
+			started = false;
+		}
+	}
+
+	/** Called once per frame. Returns true when all scenarios are done. */
+	bool step(SelfTestRun& t) {
+		if (!started) {
+			// The selftest must never clobber a real assistant.json / prompt file
+			configBackup.backup(configPath());
+			promptBackup.backup(systemPromptPath());
+			started = true;
+		}
+		if (!current) {
+			if (index >= factories.size()) {
+				finishAll();
+				return true;
+			}
+			current.reset(factories[index]());
+			INFO("[assistant selftest] scenario mock/%s", current->name());
+			controller.reset(new Controller());
+			Config cfg = defaultConfig();
+			cfg.mock = true;
+			cfg.confirmDestructive = true;
+			cfg.apiKey.clear();
+			cfg.attachSelection = true;
+			current->configure(cfg);
+			controller->setConfig(cfg);
+			controller->setClientFactory([](const ClientOptions& o) -> std::shared_ptr<LlmClient> {
+				ClientOptions mo = o;
+				// Never depend on a user's scripted responses
+				mo.mockScriptPath = "";
+				return createMockClient(mo);
+			});
+			current->t = &t;
+			current->c = controller.get();
+			scenarioStart = std::chrono::steady_clock::now();
+			try {
+				current->init();
+			}
+			catch (const std::exception& e) {
+				t.check(std::string("mock/") + current->name() + " init", false, e.what());
+			}
+		}
+
+		bool done = false;
+		controller->step();
+		current->phaseFrames++;
+		try {
+			done = current->step();
+		}
+		catch (const std::exception& e) {
+			t.check(std::string("mock/") + current->name() + " completed", false, std::string("exception: ") + e.what());
+			done = true;
+		}
+		if (!done) {
+			double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - scenarioStart).count();
+			if (sec > MOCK_SCENARIO_TIMEOUT_SEC) {
+				t.check(std::string("mock/") + current->name() + " finished in time", false, string::f("phase %d, state %d, entries: ", current->phase, (int) controller->getState()) + dumpEntries(controller.get()));
+				done = true;
+			}
+		}
+		if (done) {
+			controller->cancel();
+			current.reset();
+			controller.reset();
+			index++;
+		}
+		return false;
+	}
+};
+
+
 // ---- Driver --------------------------------------------------------------------------
 
 typedef void (*ScenarioFn)(SelfTestRun& t);
@@ -902,8 +2749,8 @@ struct ScenarioEntry {
 };
 
 
-/** Scenarios selected by RACK_ASSISTANT_SELFTEST ("tools", "mock" or "all").
-Append new scenarios here (the "mock" controller scenarios are added by a later step). */
+/** Synchronous scenarios selected by RACK_ASSISTANT_SELFTEST ("tools", "mock" or "all").
+The step-driven "mock" controller scenarios run afterwards, see MockRunner. */
 std::vector<ScenarioEntry> selectScenarios(const std::string& mode) {
 	std::vector<ScenarioEntry> list;
 	if (mode == "tools" || mode == "all")
@@ -942,13 +2789,31 @@ void finish(SelfTestRun& run) {
 
 
 void sceneStepHook() {
-	// state: 0 = not initialized, 1 = waiting for frames, 2 = done / disabled
+	// state: 0 = not initialized, 1 = waiting for frames, 2 = done / disabled, 3 = running the mock scenarios
 	static int state = 0;
 	static int frames = 0;
 	static std::string mode;
+	static SelfTestRun run;
+	static std::unique_ptr<MockRunner> mockRunner;
 
 	if (state == 2)
 		return;
+	if (state == 3) {
+		bool done = false;
+		try {
+			done = mockRunner->step(run);
+		}
+		catch (const std::exception& e) {
+			run.check("mock scenarios completed", false, std::string("exception: ") + e.what());
+			done = true;
+		}
+		if (done) {
+			mockRunner.reset();
+			state = 2;
+			finish(run);
+		}
+		return;
+	}
 	if (state == 0) {
 		const char* env = getenv("RACK_ASSISTANT_SELFTEST");
 		mode = env ? env : "";
@@ -964,9 +2829,7 @@ void sceneStepHook() {
 
 	if (++frames < 30)
 		return;
-	state = 2;
 
-	SelfTestRun run;
 	for (const ScenarioEntry& s : selectScenarios(mode)) {
 		INFO("[assistant selftest] scenario %s", s.name);
 		try {
@@ -979,7 +2842,14 @@ void sceneStepHook() {
 			run.check(std::string("scenario ") + s.name + " completed", false, "unknown exception");
 		}
 	}
-	finish(run);
+	if (mode == "mock" || mode == "all") {
+		mockRunner.reset(new MockRunner);
+		state = 3;
+	}
+	else {
+		state = 2;
+		finish(run);
+	}
 }
 
 

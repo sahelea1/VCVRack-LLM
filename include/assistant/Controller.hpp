@@ -97,6 +97,11 @@ struct Controller {
 	/** API conversation without the system message. */
 	const std::vector<ChatMessage>& getMessages() const;
 
+	/** True if the newest undo step in APP->history is the most recent run's whole change set (nothing else was done since, and the run was not split into several undo steps by edits made while it was running). False while a run is in progress. */
+	bool canUndoLastRun() const;
+	/** Undoes the most recent run's changes with one history undo step, if canUndoLastRun(). */
+	void undoLastRun();
+
 	const Config& getConfig() const;
 	/** Applies and saves the config to assistant.json. Returns false and sets `error` on save failure (the config is still applied). */
 	bool setConfig(const Config& c, std::string* error = NULL);

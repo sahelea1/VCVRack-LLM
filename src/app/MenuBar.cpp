@@ -25,6 +25,7 @@
 #include <plugin.hpp>
 #include <patch.hpp>
 #include <library.hpp>
+#include <assistant/Panel.hpp>
 
 
 namespace rack {
@@ -985,6 +986,39 @@ struct LibraryButton : MenuButton {
 
 
 ////////////////////
+// Assistant
+////////////////////
+
+
+struct AssistantButton : MenuButton {
+	void onAction(const ActionEvent& e) override {
+		ui::Menu* menu = createMenu();
+		menu->cornerFlags = BND_CORNER_TOP;
+		menu->box.pos = getAbsoluteOffset(math::Vec(0, box.size.y));
+
+		menu->addChild(createCheckMenuItem("Show assistant", widget::getKeyCommandName(GLFW_KEY_L, RACK_MOD_CTRL),
+			[=]() {return assistant::isPanelVisible();},
+			[=]() {assistant::togglePanel();}
+		));
+
+		menu->addChild(createMenuItem("New chat", "", [=]() {
+			assistant::newChat();
+		}));
+
+		menu->addChild(createMenuItem("Settings…", "", [=]() {
+			assistant::openSettings();
+		}));
+
+		menu->addChild(new ui::MenuSeparator);
+
+		menu->addChild(createMenuItem("Open user folder", "", [=]() {
+			system::openDirectory(asset::user(""));
+		}));
+	}
+};
+
+
+////////////////////
 // Help
 ////////////////////
 
@@ -1139,6 +1173,10 @@ struct MenuBar : widget::OpaqueWidget {
 		LibraryButton* libraryButton = new LibraryButton;
 		libraryButton->text = string::translate("MenuBar.library");
 		layout->addChild(libraryButton);
+
+		AssistantButton* assistantButton = new AssistantButton;
+		assistantButton->text = "Assistant";
+		layout->addChild(assistantButton);
 
 		HelpButton* helpButton = new HelpButton;
 		helpButton->text = string::translate("MenuBar.help");
