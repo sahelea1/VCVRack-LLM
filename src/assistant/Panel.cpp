@@ -417,10 +417,12 @@ struct ChatInput : uic::MultilineField {
 				e.consume(this);
 				return;
 			}
-			// Undo/redo shortcuts must not reach the patch while typing
+			// Undo/redo shortcuts must not reach the patch while typing.
+			// With an empty input they fall through to the Scene, so Ctrl+Z right after a run undoes it.
 			if (e.isKeyCommand(GLFW_KEY_Z, RACK_MOD_CTRL) || e.isKeyCommand(GLFW_KEY_Z, RACK_MOD_CTRL | GLFW_MOD_SHIFT)
 				|| e.isKeyCommand(GLFW_KEY_Y, RACK_MOD_CTRL)) {
-				e.consume(this);
+				if (!getText().empty())
+					e.consume(this);
 				return;
 			}
 		}

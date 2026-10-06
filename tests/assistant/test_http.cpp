@@ -372,6 +372,21 @@ TEST(http_no_key_for_remote_host_is_config_error) {
 	CHECK_EQ((int) s.error.kind, (int) LlmError::CONFIG);
 }
 
+TEST(http_key_over_plain_http_to_remote_host_is_refused) {
+	ClientOptions o;
+	o.apiKey = "test-key";
+	std::atomic<bool> cancel(false);
+	const char* urls[] = {"http://example.invalid/v1", "HTTP://example.invalid/v1", "http://localhost@example.invalid/v1"};
+	for (const char* url : urls) {
+		o.config.baseUrl = url;
+		ChatResponse r = createHttpClient(o)->complete(pingRequest(), cancel);
+		CHECK(!r.ok);
+		CHECK_EQ((int) r.error.kind, (int) LlmError::CONFIG);
+		CHECK(r.error.message.find("plain http://") != std::string::npos);
+		CHECK(r.error.message.find("test-key") == std::string::npos);
+	}
+}
+
 TEST(http_key_with_control_characters_is_config_error) {
 	NoProxyGuard noProxy;
 	FakeServer server;

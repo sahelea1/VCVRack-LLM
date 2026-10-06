@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 
@@ -327,9 +328,8 @@ static bool parseMessageObject(json_t* msgJ, ChatMessage* out) {
 			if (!json_is_object(callJ))
 				continue;
 			ToolCall tc;
+			// A missing id stays empty: the controller assigns ids that are unique across rounds
 			tc.id = getString(callJ, "id");
-			if (tc.id.empty())
-				tc.id = "call_" + std::to_string(i);
 			json_t* fnJ = json_object_get(callJ, "function");
 			tc.arguments = "{}";
 			if (fnJ && json_is_object(fnJ)) {
@@ -344,7 +344,6 @@ static bool parseMessageObject(json_t* msgJ, ChatMessage* out) {
 		json_t* fcJ = json_object_get(msgJ, "function_call");
 		if (fcJ && json_is_object(fcJ)) {
 			ToolCall tc;
-			tc.id = "call_0";
 			tc.name = getString(fcJ, "name");
 			tc.arguments = argumentsToString(json_object_get(fcJ, "arguments"));
 			m.toolCalls.push_back(tc);
@@ -466,7 +465,12 @@ static LlmError makeHttpError(long status, const std::string& detail) {
 	std::string st = std::to_string(status);
 	if (status == 400) {
 		e.kind = LlmError::BAD_REQUEST;
-		e.message = "The provider rejected the request (400)" + (d.empty() ? std::string() : ": " + d) + ". Check model parameters (temperature, max_tokens, reasoning) in the assistant settings.";
+		// "openai/foo is not a valid model ID": point at the model name instead of the sampling parameters
+		std::string dl = d;
+		for (size_t i = 0; i < dl.size(); i++)
+			dl[i] = (char) std::tolower((unsigned char) dl[i]);
+		bool modelProblem = dl.find("model") != std::string::npos && (dl.find("not a valid") != std::string::npos || dl.find("not found") != std::string::npos || dl.find("does not exist") != std::string::npos || dl.find("invalid model") != std::string::npos);
+		e.message = "The provider rejected the request (400)" + (d.empty() ? std::string() : ": " + d) + (modelProblem ? ". Check 'model' in the assistant settings." : ". Check model parameters (temperature, max_tokens, reasoning) in the assistant settings.");
 	}
 	else if (status == 401) {
 		e.kind = LlmError::AUTH;
@@ -482,7 +486,7 @@ static LlmError makeHttpError(long status, const std::string& detail) {
 	}
 	else if (status == 404) {
 		e.kind = LlmError::NOT_FOUND;
-		e.message = "Model or endpoint not found (404). Check 'model' and 'base_url' in the assistant settings.";
+		e.message = "Model or endpoint not found (404)" + (d.empty() ? std::string() : ": " + d) + ". Check 'model' and 'base_url' in the assistant settings.";
 	}
 	else if (status == 408) {
 		e.kind = LlmError::TIMEOUT;

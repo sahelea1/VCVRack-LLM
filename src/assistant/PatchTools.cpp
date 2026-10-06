@@ -287,10 +287,15 @@ static ToolResult addModule(json_t* args, ToolContext& ctx) {
 	ModuleRef nearRef;
 	bool hasNear = false;
 	json_t* nearJ = json_object_get(args, "near_module_id");
+	std::string nearNote;
 	if (nearJ && !json_is_null(nearJ)) {
-		if (!moduleArg(args, "near_module_id", &nearRef, &err))
-			return errorResult(err);
-		hasNear = true;
+		// near_module_id is only a placement hint: models often send a placeholder (0, -1) or the id
+		// of a module added in the same batch that does not exist yet. Do not fail the call for that.
+		std::string nearErr;
+		if (moduleArg(args, "near_module_id", &nearRef, &nearErr))
+			hasNear = true;
+		else
+			nearNote = "near_module_id does not match a module in the patch and was ignored (omit it to place the module after the previously added one).";
 	}
 
 	app::RackWidget* rack = APP->scene->rack;
@@ -415,6 +420,8 @@ static ToolResult addModule(json_t* args, ToolContext& ctx) {
 	setStr(o, "name", model->name);
 	setJson(o, "pos", posJson(placed.hp, placed.row));
 	setInt(o, "width_hp", widthHp(mw));
+	if (!nearNote.empty())
+		note += (note.empty() ? "" : " ") + nearNote;
 	if (!note.empty())
 		setStr(o, "note", note);
 
@@ -433,7 +440,11 @@ static std::string removeModuleConfirmation(json_t* args) {
 	std::string err;
 	if (!moduleArg(args, "module_id", &m, &err))
 		return "";
-	return string::f("Remove module %s and its %d cables?", moduleDescription(m).c_str(), countModuleCables(m));
+	// Module ids are long random numbers; the position identifies the module for the user
+	GridPos gp = gridPosOf(m.mw);
+	std::string pluginSlug = m.module->model && m.module->model->plugin ? m.module->model->plugin->slug : "";
+	int cables = countModuleCables(m);
+	return string::f("Remove module '%s' (%s, HP %d, row %d) and its %d cable%s?", moduleName(m).c_str(), pluginSlug.c_str(), gp.hp, gp.row, cables, cables == 1 ? "" : "s");
 }
 
 
@@ -530,8 +541,34 @@ static ToolResult setParam(json_t* args, ToolContext& ctx) {
 	json_t* dispJ = json_object_get(args, "display_value");
 	bool hasValue = valueJ && !json_is_null(valueJ);
 	bool hasDisp = dispJ && !json_is_null(dispJ);
-	if (hasValue == hasDisp)
-		return errorResult("Provide exactly one of 'value' (raw knob value) or 'display_value' (value in the displayed unit). Use get_module_info to see ranges and display units.");
+	if (!hasValue && !hasDisp)
+		return errorResult("Provide one of 'value' (raw knob value) or 'display_value' (value in the displayed unit). Use get_module_info to see ranges and display units.");
+	std::string bothNote;
+	bool bothZero = false;
+	if (hasValue && hasDisp) {
+		// Models often fill both fields and put a placeholder 0 into the one they do not mean
+		// ({"value":0.72,"display_value":0}). A zero loses against a non-zero number; if both are
+		// non-zero the displayed unit is what the model reasons about, so display_value wins.
+		double v = json_is_number(valueJ) ? json_number_value(valueJ) : 0.0;
+		double d = json_is_number(dispJ) ? json_number_value(dispJ) : 0.0;
+		if (d == 0.0 && v != 0.0) {
+			hasDisp = false;
+			bothNote = "Both 'value' and 'display_value' were given; display_value 0 was treated as a placeholder and the non-zero 'value' was used. If you meant display 0, call set_param again with only display_value. Send only one of them.";
+		}
+		else if (v == 0.0 && d != 0.0) {
+			hasValue = false;
+			bothNote = "Both 'value' and 'display_value' were given; value 0 was treated as a placeholder and the non-zero 'display_value' was used. If you meant raw 0, call set_param again with only value. Send only one of them.";
+		}
+		else if (v == 0.0) {
+			hasDisp = false;
+			bothZero = true;
+			bothNote = "Both 'value' and 'display_value' were 0; 'value' was used. Send only one of them.";
+		}
+		else {
+			hasValue = false;
+			bothNote = "Both 'value' and 'display_value' were given; display_value was used and value ignored. Send only one of them.";
+		}
+	}
 	float requested = 0.f;
 	if (!argFloat(args, hasValue ? "value" : "display_value", &requested))
 		return errorResult(string::f("Invalid '%s': expected a finite number.", hasValue ? "value" : "display_value"));
@@ -569,6 +606,13 @@ static ToolResult setParam(json_t* args, ToolContext& ctx) {
 		}
 	}
 
+	if (bothZero) {
+		// Raw 0 and display 0 only agree for some parameters. Say so loudly when they do not.
+		float shown = pq->getDisplayValue();
+		if (std::fabs(shown) > 1e-3f)
+			note = string::f("Raw value 0 was applied and it displays as %g, not 0. If you meant display 0, call set_param again with only display_value.", shown);
+	}
+
 	bool changed = newV != oldV;
 	if (changed) {
 		history::ParamChange* h = new history::ParamChange;
@@ -591,6 +635,8 @@ static ToolResult setParam(json_t* args, ToolContext& ctx) {
 	setNum(o, "min", minV);
 	setNum(o, "max", maxV);
 	setBool(o, "clamped", clamped);
+	if (!bothNote.empty())
+		note += (note.empty() ? "" : " ") + bothNote;
 	if (!note.empty())
 		setStr(o, "note", note);
 	ToolResult r;
@@ -826,6 +872,27 @@ static ToolResult disconnectTool(json_t* args, ToolContext& ctx) {
 
 // ---- save_patch ----------------------------------------------------------------------
 
+/** Canonical form of the deepest existing ancestor of `path` plus the not yet existing rest.
+Returns "" if nothing could be resolved. */
+static std::string canonicalExisting(const std::string& path) {
+	std::string existing = path;
+	std::string rest;
+	while (!existing.empty() && !system::exists(existing)) {
+		std::string parent = system::getDirectory(existing);
+		if (parent == existing)
+			return "";
+		rest = "/" + system::getFilename(existing) + rest;
+		existing = parent;
+	}
+	if (existing.empty())
+		return "";
+	std::string canon = system::getCanonical(existing);
+	if (canon.empty())
+		return "";
+	return canon + rest;
+}
+
+
 /** Resolves the target file. Relative paths live in <user>/patches. */
 static bool resolveSavePath(json_t* args, std::string* path, std::string* err) {
 	std::string p;
@@ -863,9 +930,22 @@ static bool resolveSavePath(json_t* args, std::string* path, std::string* err) {
 			return false;
 		}
 	}
-	if (system::getExtension(p).empty())
+	// Always write a .vcv file. Other extensions get ".vcv" appended.
+	if (string::lowercase(system::getExtension(p)) != ".vcv")
 		p += ".vcv";
-	*path = system::join(asset::user("patches"), p);
+	std::string root = asset::user("patches");
+	std::string full = system::join(root, p);
+
+	// Symlinks inside the patches folder must not lead outside of it. Canonicalize the deepest
+	// existing part of the path (the file itself if it exists, else its closest existing parent)
+	// and require it to stay under the canonical patches folder.
+	std::string rootCanon = canonicalExisting(root);
+	std::string fullCanon = canonicalExisting(full);
+	if (rootCanon.empty() || fullCanon.size() <= rootCanon.size() || fullCanon.compare(0, rootCanon.size(), rootCanon) != 0 || fullCanon[rootCanon.size()] != '/') {
+		*err = "Invalid 'path': the target resolves outside the Rack user patches folder.";
+		return false;
+	}
+	*path = full;
 	return true;
 }
 
@@ -968,7 +1048,7 @@ void registerPatchTools(ToolRegistry& r) {
 		Tool t;
 		t.name = "add_module";
 		t.description = "Add a module to the patch. Use the plugin and model slugs exactly as returned by search_modules. Without a position the module is placed in the first free slot to the right of the previously added module (modules never overlap). Positions are in grid units: hp (1 HP = 15 px, horizontal) and row (0 = first row).";
-		t.parametersSchema = R"({"type":"object","properties":{"plugin":{"type":"string","description":"Plugin slug, e.g. \"Fundamental\"."},"model":{"type":"string","description":"Model slug, e.g. \"VCO\"."},"position":{"type":"object","properties":{"hp":{"type":"integer"},"row":{"type":"integer"}},"required":["hp"],"description":"Optional explicit position. If occupied, the nearest free slot in that row is used."},"near_module_id":{"type":"integer","description":"Optional: place in the first free slot to the right of this module."}},"required":["plugin","model"]})";
+		t.parametersSchema = R"({"type":"object","properties":{"plugin":{"type":"string","description":"Plugin slug, e.g. \"Fundamental\"."},"model":{"type":"string","description":"Model slug, e.g. \"VCO\"."},"position":{"type":"object","properties":{"hp":{"type":"integer"},"row":{"type":"integer"}},"required":["hp"],"description":"Optional explicit position. If occupied, the nearest free slot in that row is used."},"near_module_id":{"type":"integer","description":"Optional: id of a module that already exists in the patch; place in the first free slot to its right. Omit it otherwise (never send 0 or -1 as a placeholder)."}},"required":["plugin","model"]})";
 		t.run = addModule;
 		r.add(t);
 	}
@@ -992,8 +1072,8 @@ void registerPatchTools(ToolRegistry& r) {
 	{
 		Tool t;
 		t.name = "set_param";
-		t.description = "Set a module parameter (knob, switch, button). param_id is the integer id or the parameter name (case-insensitive). Give exactly one of: value (the raw knob value within the parameter's min..max) or display_value (the number as shown on screen, e.g. 440 for 440 Hz). Values are clamped to the range; the result reports the final value and whether it was clamped. Use get_module_info for ranges, units and switch options.";
-		t.parametersSchema = R"({"type":"object","properties":{"module_id":{"type":"integer"},"param_id":{"type":["integer","string"],"description":"Parameter index or name."},"value":{"type":"number","description":"Raw value."},"display_value":{"type":"number","description":"Value in displayed units (e.g. Hz, ms, %)."}},"required":["module_id","param_id"]})";
+		t.description = "Set a module parameter (knob, switch, button). param_id is the integer id or the parameter name (case-insensitive). Give exactly one of: value (the raw knob value within the parameter's min..max) or display_value (the number as shown on screen, e.g. 440 for 440 Hz). If you send both, a 0 in one of them is treated as a placeholder for the other, so send only the one you mean. Values are clamped to the range; the result reports the final value and whether it was clamped. Use get_module_info for ranges, units and switch options.";
+		t.parametersSchema = R"({"type":"object","properties":{"module_id":{"type":"integer"},"param_id":{"type":["integer","string"],"description":"Parameter index or name."},"value":{"type":"number","description":"Raw knob value. Send either this or display_value, never both."},"display_value":{"type":"number","description":"Value in displayed units (e.g. Hz, ms, %). Send either this or value, never both."}},"required":["module_id","param_id"]})";
 		t.run = setParam;
 		r.add(t);
 	}
@@ -1016,7 +1096,7 @@ void registerPatchTools(ToolRegistry& r) {
 	{
 		Tool t;
 		t.name = "save_patch";
-		t.description = "Save the patch. Without a path the current patch file is overwritten (an untitled patch needs a path). A relative path is stored in the Rack user patches folder; \".vcv\" is appended if there is no extension. Overwriting a different existing file asks the user to confirm.";
+		t.description = "Save the patch. Without a path the current patch file is overwritten (an untitled patch needs a path). A relative path is stored in the Rack user patches folder; \".vcv\" is appended unless the name already ends in .vcv. Overwriting a different existing file asks the user to confirm.";
 		t.parametersSchema = R"({"type":"object","properties":{"path":{"type":"string","description":"File name relative to the user patches folder, e.g. \"my-acid.vcv\"."}}})";
 		t.confirmation = savePatchConfirmation;
 		t.run = savePatch;

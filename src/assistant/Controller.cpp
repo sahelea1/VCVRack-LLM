@@ -34,6 +34,8 @@ static const size_t MAX_TOOL_RESULT_BYTES = 24000;
 static const int MAX_TOOLS_PER_STEP = 4;
 /** Maximum number of selected modules described in the attachment. */
 static const size_t MAX_SELECTION_LISTED = 40;
+/** The run stops after this many consecutive tool rounds in which every call failed. */
+static const int MAX_FAILED_ROUNDS = 3;
 /** Maximum length of an error shown in the ACTIONS entry. */
 static const size_t MAX_ACTION_ERROR_BYTES = 80;
 
@@ -123,10 +125,16 @@ struct Controller::Internal {
 	uint64_t runPatchGeneration = 0;
 	ToolContext ctx;
 	int round = 0;
+	/** Consecutive tool rounds in which every call failed (the model is stuck in a loop) */
+	int failedRounds = 0;
+	/** Some call of the current round succeeded */
+	bool roundHadSuccess = false;
 	/** System prompt + environment block, fixed for the whole run */
 	std::string systemText;
 	/** Non-empty: reasoning effort override for this run only */
 	std::string effortOverride;
+	/** Endpoint/model/reasoning settings that effortOverride was learned for */
+	std::string effortOverrideKey;
 	bool retriedWithNone = false;
 	int requestCount = 0;
 	int64_t totalTokens = 0;
@@ -259,8 +267,19 @@ struct Controller::Internal {
 			e = &addEntry(ChatEntry::ACTIONS, "");
 			actionsEntryId = e->id;
 		}
+		if (!e->actions.empty()) {
+			// Merge identical consecutive actions ("text ×3") so a model repeating a failing call does not flood the chat
+			ChatEntry::Action& last = e->actions.back();
+			if (last.ok == ok && last.readOnly == readOnly && last.key == text) {
+				last.repeat++;
+				last.text = text + string::f(" \xc3\x97%d", last.repeat);
+				revision++;
+				return;
+			}
+		}
 		ChatEntry::Action a;
 		a.text = text;
+		a.key = text;
 		a.ok = ok;
 		a.readOnly = readOnly;
 		e->actions.push_back(a);
@@ -390,7 +409,13 @@ struct Controller::Internal {
 
 		// Fresh run state
 		systemText = loadSystemPrompt() + "\n\n" + environmentBlock();
-		effortOverride.clear();
+		// The "none" fallback learned from a 400 stays for the following runs as long as endpoint, model
+		// and reasoning settings are unchanged (otherwise every message would cost a failing request first)
+		std::string overrideKey = config.baseUrl + "|" + config.model + "|" + config.reasoningEffort + "|" + config.reasoningParamStyle;
+		if (overrideKey != effortOverrideKey) {
+			effortOverride.clear();
+			effortOverrideKey = overrideKey;
+		}
 		retriedWithNone = false;
 		requestCount = 0;
 		totalTokens = 0;
@@ -398,6 +423,8 @@ struct Controller::Internal {
 		totalCost = 0.0;
 		costKnown = false;
 		round = 0;
+		failedRounds = 0;
+		roundHadSuccess = false;
 		calls.clear();
 		nextCall = 0;
 		actionsEntryId = 0;
@@ -637,6 +664,7 @@ struct Controller::Internal {
 			revision++;
 			return;
 		}
+		DEBUG("Assistant: tool call %s %s", tc.name.c_str(), truncateUtf8(tc.arguments, 300).c_str());
 		beginUndo();
 		ToolResult r = defaultRegistry().execute(tc.name, tc.arguments, ctx);
 		endUndo();
@@ -644,8 +672,13 @@ struct Controller::Internal {
 		if (content.size() > MAX_TOOL_RESULT_BYTES)
 			content = truncateUtf8(content, MAX_TOOL_RESULT_BYTES) + string::f("\n[Result truncated: it was longer than %d bytes.]", (int) MAX_TOOL_RESULT_BYTES);
 		appendToolMessage(tc, content);
-		if (!r.ok)
+		if (r.ok)
+			roundHadSuccess = true;
+		if (!r.ok) {
+			// Tool arguments never contain secrets; DEBUG level is only visible in dev mode (-d)
+			DEBUG("Assistant: tool %s failed: %s (arguments: %s)", tc.name.c_str(), shortError(r).c_str(), truncateUtf8(tc.arguments, 300).c_str());
 			addAction("✗ " + tc.name + ": " + shortError(r), false, false);
+		}
 		else if (!r.summary.empty())
 			addAction(r.summary, true, r.readOnly);
 		else
@@ -682,8 +715,15 @@ struct Controller::Internal {
 			nextCall = 0;
 			actionsEntryId = 0;
 			round++;
+			failedRounds = roundHadSuccess ? 0 : failedRounds + 1;
+			roundHadSuccess = false;
 			if (round >= config.maxToolRounds) {
 				addEntry(ChatEntry::INFO, string::f("Stopped after %d tool rounds (max_tool_rounds).", round));
+				endRun();
+			}
+			else if (failedRounds >= MAX_FAILED_ROUNDS) {
+				// Do not burn tokens while the model repeats failing calls
+				addEntry(ChatEntry::INFO, string::f("Stopped: the last %d tool rounds failed. Rephrase the request or try again.", failedRounds));
 				endRun();
 			}
 			else {
@@ -842,8 +882,13 @@ bool Controller::isBusy() const {
 std::string Controller::getStatusText() const {
 	const Internal& d = *internal;
 	switch (d.state) {
-		case IDLE:
-			return d.lastRunSummary;
+		case IDLE: {
+			// The learned effort fallback stays active across runs and chats, so keep it visible
+			std::string s = d.lastRunSummary;
+			if (!d.effortOverride.empty())
+				s += std::string(s.empty() ? "" : " · ") + "effort " + d.effortOverride + " (provider fallback)";
+			return s;
+		}
 		case WAITING_HTTP: {
 			auto elapsed = std::chrono::steady_clock::now() - d.requestStart;
 			int sec = (int) std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();

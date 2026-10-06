@@ -485,8 +485,9 @@ TEST(response_missing_tool_call_ids) {
 	ChatResponse r = parseResponse(200, body);
 	REQUIRE(r.ok);
 	REQUIRE(r.message.toolCalls.size() == 3);
-	CHECK_EQ(r.message.toolCalls[0].id, "call_0");
-	CHECK_EQ(r.message.toolCalls[1].id, "call_1");
+	// Missing ids stay empty; the controller assigns round-unique ids
+	CHECK_EQ(r.message.toolCalls[0].id, "");
+	CHECK_EQ(r.message.toolCalls[1].id, "");
 	CHECK_EQ(r.message.toolCalls[2].id, "keep");
 }
 
@@ -503,7 +504,7 @@ TEST(response_legacy_function_call) {
 	ChatResponse r = parseResponse(200, "{\"choices\":[{\"finish_reason\":\"function_call\",\"message\":{\"content\":null,\"function_call\":{\"name\":\"get_patch\",\"arguments\":\"{\\\"a\\\":1}\"}}}]}");
 	REQUIRE(r.ok);
 	REQUIRE(r.message.toolCalls.size() == 1);
-	CHECK_EQ(r.message.toolCalls[0].id, "call_0");
+	CHECK_EQ(r.message.toolCalls[0].id, "");
 	CHECK_EQ(r.message.toolCalls[0].name, "get_patch");
 	CHECK_EQ(r.message.toolCalls[0].arguments, "{\"a\":1}");
 }
@@ -623,7 +624,7 @@ TEST(http_error_table) {
 		{401, LlmError::AUTH, "Authentication failed (401). Check your API key (RACK_ASSISTANT_API_KEY / OPENROUTER_API_KEY or the assistant settings)."},
 		{402, LlmError::PAYMENT, "Insufficient credits (402). Top up your account or pick a cheaper model."},
 		{403, LlmError::FORBIDDEN, "Access denied (403): The detail"},
-		{404, LlmError::NOT_FOUND, "Model or endpoint not found (404). Check 'model' and 'base_url' in the assistant settings."},
+		{404, LlmError::NOT_FOUND, "Model or endpoint not found (404): The detail. Check 'model' and 'base_url' in the assistant settings."},
 		{408, LlmError::TIMEOUT, "The provider timed out (408). Try again."},
 		{413, LlmError::BAD_REQUEST, "Request too large (413). Start a new chat to shorten the conversation."},
 		{429, LlmError::RATE_LIMIT, "Rate limited (429). Wait a moment and try again."},
@@ -657,6 +658,9 @@ TEST(http_error_detail_sources) {
 	CHECK_EQ(e.detail, "");
 	CHECK_EQ(e.message, "The provider rejected the request (400). Check model parameters (temperature, max_tokens, reasoning) in the assistant settings.");
 	// no double period
+	LlmError bm = httpError(400, "{\"error\":{\"message\":\"openai/foo is not a valid model ID\"}}");
+	CHECK_EQ(bm.message, "The provider rejected the request (400): openai/foo is not a valid model ID. Check 'model' in the assistant settings.");
+
 	LlmError p = httpError(400, "{\"error\":{\"message\":\"Unsupported parameter.\"}}");
 	CHECK_EQ(p.detail, "Unsupported parameter.");
 	CHECK(p.message.find("..") == std::string::npos);

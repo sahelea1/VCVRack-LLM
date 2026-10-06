@@ -195,6 +195,38 @@ static ToolResult searchModules(json_t* args, ToolContext& ctx) {
 		}
 	}
 
+	if (matches.empty() && !query.empty() && query.find(' ') != std::string::npos) {
+		// Multi-word queries ("low pass filter") often match nothing in the fuzzy index; search the words alone
+		std::string word;
+		std::vector<std::string> words;
+		for (size_t i = 0; i <= query.size(); i++) {
+			if (i == query.size() || query[i] == ' ') {
+				if (word.size() >= 3)
+					words.push_back(word);
+				word.clear();
+			}
+			else {
+				word += query[i];
+			}
+		}
+		// Rank models by the number of distinct query words they matched, so that a generic word
+		// ("low") cannot push the models matching the whole phrase behind the default limit
+		std::map<plugin::Model*, int> hits;
+		for (const std::string& w : words) {
+			std::set<plugin::Model*> wordSeen;
+			auto results = getIndex().db.search(w);
+			for (const auto& result : results) {
+				plugin::Model* m = result.key;
+				accept(m);
+				if (seen.count(m) && wordSeen.insert(m).second)
+					hits[m]++;
+			}
+		}
+		std::stable_sort(matches.begin(), matches.end(), [&](plugin::Model* a, plugin::Model* b) {
+			return hits[a] > hits[b];
+		});
+	}
+
 	json_t* o = json_object();
 	setInt(o, "total_matches", (int64_t) matches.size());
 	json_t* arr = json_array();
@@ -358,14 +390,21 @@ static ToolResult getModuleInfo(json_t* args, ToolContext& ctx) {
 
 	json_t* idj = json_object_get(args, "module_id");
 	if (idj && !json_is_null(idj)) {
-		if (!moduleArg(args, "module_id", &inst, &err))
-			return errorResult(err);
-		model = inst.module->model;
-		isInstance = true;
-		if (!model)
-			return errorResult("This module has no model information.");
+		if (moduleArg(args, "module_id", &inst, &err)) {
+			model = inst.module->model;
+			isInstance = true;
+			if (!model)
+				return errorResult("This module has no model information.");
+		}
+		else {
+			// Models tend to send a placeholder module_id (0 or -1) together with plugin + model.
+			// Fall back to the catalog lookup in that case instead of failing.
+			std::string p, m;
+			if (!argString(args, "plugin", &p) || !argString(args, "model", &m) || trim(p).empty() || trim(m).empty())
+				return errorResult(err);
+		}
 	}
-	else {
+	if (!isInstance) {
 		std::string pluginSlug, modelSlug;
 		if (!argString(args, "plugin", &pluginSlug) || !argString(args, "model", &modelSlug) || trim(pluginSlug).empty() || trim(modelSlug).empty())
 			return errorResult("Provide either 'module_id' (a module in the patch) or both 'plugin' and 'model' (slugs from search_modules).");
@@ -445,7 +484,7 @@ void registerCatalogTools(ToolRegistry& r) {
 		Tool t;
 		t.name = "get_module_info";
 		t.description = "Describe a module: its parameters (id, name, range, default, unit, display text at min/max/default, switch options), input ports and output ports (id, name), and width. Pass module_id for a module in the patch (adds current values and which ports are connected), or plugin + model for any installed module.";
-		t.parametersSchema = R"({"type":"object","properties":{"module_id":{"type":"integer","description":"A module in the current patch."},"plugin":{"type":"string"},"model":{"type":"string"}}})";
+		t.parametersSchema = R"({"type":"object","properties":{"module_id":{"type":"integer","description":"A module that exists in the current patch (omit when using plugin + model)."},"plugin":{"type":"string"},"model":{"type":"string"}}})";
 		t.run = getModuleInfo;
 		r.add(t);
 	}

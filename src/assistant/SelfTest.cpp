@@ -21,6 +21,9 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#if !defined ARCH_WIN
+#include <unistd.h>
+#endif
 
 #include <GLFW/glfw3.h>
 
@@ -349,6 +352,24 @@ void toolsScenario(SelfTestRun& t) {
 		t.check("search_modules summary", has(r.r.summary, "Searched \"VCO\""), r.r.summary);
 		t.check("search_modules read-only", r.r.readOnly);
 
+		// Multi-word query that the fuzzy index alone does not match falls back to the single words
+		Resp rmw = S.call("search_modules", R"({"query":"xyzzy filter"})");
+		t.check("search_modules multi-word fallback finds filters", rmw.ok() && jlen(rmw.get("results")) >= 1, rmw.r.content);
+
+		// Words that match the same model rank first: a filter must be within the default 12 results
+		{
+			Resp rlp = S.call("search_modules", R"({"query":"low pass filter"})");
+			bool filterInTop = false;
+			json_t* results = rlp.get("results");
+			for (size_t i = 0; results && i < jlen(results); i++) {
+				json_t* item = json_array_get(results, i);
+				std::string nm = jstr(item, "name");
+				if (nm.find("Filter") != std::string::npos || nm.find("VCF") != std::string::npos || nm.find("filter") != std::string::npos)
+					filterInTop = true;
+			}
+			t.check("search_modules 'low pass filter' lists a filter among the first results", rlp.ok() && filterInTop, rlp.r.content);
+		}
+
 		// Tag filter
 		Resp rf = S.call("search_modules", R"({"query":"VCF","tag":"Filter"})");
 		bool foundVcf = false, allFilter = rf.ok() && jlen(rf.get("results")) > 0;
@@ -418,6 +439,10 @@ void toolsScenario(SelfTestRun& t) {
 		Resp ri2 = S.call("get_module_info", R"({"plugin":"Fundamental","model":"VCF"})");
 		t.check("get_module_info is deterministic (cached)", ri2.ok() && ri2.r.content == ri.r.content);
 		t.check("get_module_info summary", has(ri.r.summary, "Inspected"), ri.r.summary);
+		Resp rph = S.call("get_module_info", R"({"module_id":0,"plugin":"Fundamental","model":"VCF"})");
+		t.check("get_module_info placeholder module_id + plugin/model falls back to the catalog", rph.ok() && jstr(rph.j.get(), "model") == "VCF", rph.error());
+		Resp rbadId = S.call("get_module_info", R"({"module_id":0})");
+		t.check("get_module_info unknown module_id alone -> error", !rbadId.ok());
 
 		Resp rvco = S.call("get_module_info", R"({"plugin":"Fundamental","model":"VCO"})");
 		json_t* fm = entryByName(rvco.get("params"), "FM mode");
@@ -514,9 +539,14 @@ void toolsScenario(SelfTestRun& t) {
 		t.check("add_module invalid position -> error", !r.ok());
 		r = S.call("add_module", R"({"plugin":"Fundamental","model":"VCO","position":{"hp":999999999,"row":0}})");
 		t.check("add_module out-of-range position -> error", !r.ok());
-		r = S.call("add_module", R"({"plugin":"Fundamental","model":"VCO","near_module_id":99999999})");
-		t.check("add_module invalid near_module_id -> error", !r.ok());
 		t.check("failed add_module calls did not add modules", moduleCount() == before && APP->engine->getNumModules() == before);
+		// An unknown near_module_id (models send placeholders such as 0) is only a placement hint: ignored with a note
+		r = S.call("add_module", R"({"plugin":"Fundamental","model":"VCO","near_module_id":99999999})");
+		t.check("add_module unknown near_module_id -> ok with note", r.ok() && !jstr(r.j.get(), "note").empty() && moduleCount() == before + 1, r.r.content);
+		if (r.ok()) {
+			Resp rm = S.call("remove_module", string::f("{\"module_id\":%lld}", (long long) jint(r.j.get(), "module_id")));
+			t.check("placeholder module removed again", rm.ok() && moduleCount() == before, rm.r.content);
+		}
 	}
 
 	// ---- Connect -----------------------------------------------------------------------
@@ -662,7 +692,13 @@ void toolsScenario(SelfTestRun& t) {
 		r = S.call("set_param", string::f("{\"module_id\":%lld,\"param_id\":\"nonexistent\",\"value\":0.5}", (long long) vcfId));
 		t.check("set_param unknown param name -> error listing params", !r.ok() && has(r.error(), "Available") && has(r.error(), "Resonance"), r.error());
 		r = S.call("set_param", string::f("{\"module_id\":%lld,\"param_id\":0,\"value\":0.5,\"display_value\":1}", (long long) vcfId));
-		t.check("set_param both value and display_value -> error", !r.ok());
+		t.check("set_param both value and display_value -> display_value wins, with a note", r.ok() && !jstr(r.j.get(), "note").empty() && std::fabs(jnum(r.j.get(), "value") - 0.5) > 1e-6, r.r.content);
+		r = S.call("set_param", string::f("{\"module_id\":%lld,\"param_id\":%lld,\"value\":0.5,\"display_value\":0}", (long long) vcfId, (long long) cutoffId));
+		t.check("set_param value + placeholder display_value 0 -> value used", r.ok() && std::fabs(jnum(r.j.get(), "value") - 0.5) < 1e-6 && !jstr(r.j.get(), "note").empty(), r.r.content);
+		r = S.call("set_param", string::f("{\"module_id\":%lld,\"param_id\":%lld,\"value\":0,\"display_value\":1000}", (long long) vcfId, (long long) cutoffId));
+		t.check("set_param placeholder value 0 + display_value -> display_value used", r.ok() && std::fabs(jnum(r.j.get(), "value")) > 1e-6 && has(jstr(r.j.get(), "display"), "Hz"), r.r.content);
+		// restore the cutoff for the checks below
+		S.call("set_param", string::f("{\"module_id\":%lld,\"param_id\":%lld,\"value\":%.9g}", (long long) vcfId, (long long) cutoffId, (double) mid));
 		r = S.call("set_param", string::f("{\"module_id\":%lld,\"param_id\":0}", (long long) vcfId));
 		t.check("set_param neither value nor display_value -> error", !r.ok());
 		r = S.call("set_param", string::f("{\"module_id\":%lld,\"param_id\":0,\"value\":\"abc\"}", (long long) vcfId));
@@ -770,7 +806,7 @@ void toolsScenario(SelfTestRun& t) {
 
 		// ---- remove_module -------------------------------------------------------------------
 		std::string conf = reg.confirmationFor("remove_module", string::f("{\"module_id\":%lld}", (long long) vcfId));
-		t.check("remove_module confirmation non-empty", !conf.empty() && has(conf, "VCF") && has(conf, "2 cables") && has(conf, std::to_string((long long) vcfId)), conf);
+		t.check("remove_module confirmation non-empty", !conf.empty() && has(conf, "VCF") && has(conf, "2 cables") && has(conf, "HP"), conf);
 		t.check("remove_module confirmation empty for invalid id", reg.confirmationFor("remove_module", "{\"module_id\":5}").empty() && reg.confirmationFor("remove_module", "{bad").empty() && reg.confirmationFor("remove_module", "{}").empty());
 		t.check("non-destructive tools have empty confirmation", reg.confirmationFor("connect", "{}").empty() && reg.confirmationFor("get_patch", "{}").empty() && reg.confirmationFor("nonexistent", "{}").empty());
 
@@ -840,6 +876,26 @@ void toolsScenario(SelfTestRun& t) {
 		t.check("save_patch absolute path rejected", !r.ok());
 		r = S.call("save_patch", "{\"path\":\"../evil\"}");
 		t.check("save_patch '..' rejected", !r.ok());
+#if !defined ARCH_WIN
+		{
+			// A symlink inside the patches folder must not lead the file outside of it
+			std::string outside = system::join(asset::user(), dirName + "-outside");
+			std::string link = system::join(asset::user("patches"), dirName + "/link");
+			system::createDirectories(outside);
+			bool linked = symlink(outside.c_str(), link.c_str()) == 0;
+			t.check("selftest created a symlink", linked);
+			if (linked) {
+				r = S.call("save_patch", "{\"path\":\"assistant-selftest/link/x\"}");
+				t.check("save_patch through a symlink leaving the patches folder is rejected", !r.ok() && !system::exists(system::join(outside, "x.vcv")), r.r.content);
+				unlink(link.c_str());
+			}
+			system::removeRecursively(outside);
+		}
+#endif
+		r = S.call("save_patch", "{\"path\":\"assistant-selftest/c.json\"}");
+		t.check("save_patch forces the .vcv extension", r.ok() && has(jstr(r.j.get(), "path"), "c.json.vcv") && system::isFile(system::join(asset::user("patches"), dirName + "/c.json.vcv")), r.r.content);
+		// Keep the saved patch path on b.vcv for the following checks
+		r = S.call("save_patch", "{\"path\":\"assistant-selftest/b\"}");
 		r = S.call("save_patch", "{\"path\":5}");
 		t.check("save_patch invalid path type rejected", !r.ok());
 		// The saved patch must be loadable JSON/archive: at least non-empty
@@ -1574,7 +1630,7 @@ struct RetryScenario : MockScenario {
 				ck("final ASSISTANT text", e && e->text == "Retry worked.", dumpEntries(c));
 				ck("no ERROR entry", countKind(c, ChatEntry::ERROR) == 0);
 				ck("exactly two requests, one with 'none'", probe->calls == 2 && probe->noneCalls == 1, string::f("%d calls, %d none", probe->calls.load(), probe->noneCalls.load()));
-				ck("usage of the successful request is summarized", c->getStatusText() == "Last run: 1 request \xc2\xb7 15 tokens \xc2\xb7 $0.0123", c->getStatusText());
+				ck("usage of the successful request is summarized", c->getStatusText() == "Last run: 1 request \xc2\xb7 15 tokens \xc2\xb7 $0.0123 \xc2\xb7 effort none (provider fallback)", c->getStatusText());
 				ck("config is unchanged", c->getConfig().reasoningEffort == "medium");
 				ck("second send accepted", c->send("again", false));
 				next();
@@ -1587,7 +1643,8 @@ struct RetryScenario : MockScenario {
 					if (e.kind == ChatEntry::INFO && e.text == retryText)
 						retries++;
 				}
-				ck("override applies to one run only (retried again next run)", retries == 2 && probe->calls == 4, string::f("%d retries, %d calls", retries, probe->calls.load()));
+				ck("override sticks for the next run (no second failing request, no second INFO)", retries == 1 && probe->calls == 3, string::f("%d retries, %d calls", retries, probe->calls.load()));
+				ck("the active effort fallback stays visible in the status", has(c->getStatusText(), "effort none (provider fallback)"), c->getStatusText());
 				Config cfg = c->getConfig();
 				cfg.reasoningEffort = "off";
 				c->setConfig(cfg);
@@ -1598,7 +1655,7 @@ struct RetryScenario : MockScenario {
 				if (!idle())
 					return false;
 				const ChatEntry* e = lastOfKind(c, ChatEntry::ERROR);
-				ck("effort 'off' is not retried: error shown", e && has(e->text, "rejected the request") && probe->calls == 5, dumpEntries(c));
+				ck("effort 'off' is not retried: error shown", e && has(e->text, "rejected the request") && probe->calls == 4, dumpEntries(c));
 				return true;
 			}
 		}
@@ -1946,6 +2003,47 @@ struct GatedScenario : MockScenario {
 	}
 	bool blocked() const {
 		return gs->waiting.load() == 1 && c->getState() == Controller::WAITING_HTTP;
+	}
+};
+
+
+/** A model that keeps repeating failing calls: identical failures of a round are merged into one "xN" action and the run
+stops after MAX_FAILED_ROUNDS rounds without a single successful call. */
+struct FailLoopScenario : MockScenario {
+	const char* name() const override {
+		return "failloop";
+	}
+	void init() override {
+		useScript([](const ClientOptions&, const ChatRequest&, int) -> ChatResponse {
+			// Two identical failing calls per round (set_param on a module that does not exist)
+			std::string call = "{\"type\":\"function\",\"function\":{\"name\":\"set_param\",\"arguments\":\"{\\\"module_id\\\":-5,\\\"param_id\\\":0,\\\"value\\\":1}\"}}";
+			std::string body = "{\"model\":\"selftest\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"a\",";
+			body += call.substr(1) + ",{\"id\":\"b\"," + call.substr(1) + "]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}";
+			return parseResponse(200, body);
+		});
+	}
+	bool step() override {
+		switch (phase) {
+			case 0: {
+				ck("send accepted", c->send("go", false));
+				next();
+			} break;
+			case 1: {
+				if (!idle())
+					return false;
+				ck("stopped by the failed-rounds guard", findEntryWith(c, ChatEntry::INFO, "Stopped: the last 3 tool rounds failed") != NULL, dumpEntries(c));
+				ck("exactly 3 model rounds", countRole(c, ChatMessage::ASSISTANT) == 3, std::to_string(countRole(c, ChatMessage::ASSISTANT)));
+				ck("API history is valid", historyValid(c->getMessages()));
+				bool merged = false;
+				for (const ChatEntry& e : c->getEntries()) {
+					if (e.kind == ChatEntry::ACTIONS && e.actions.size() == 1 && e.actions[0].repeat == 2 && has(e.actions[0].text, "\xc3\x97" "2"))
+						merged = true;
+				}
+				ck("identical failures of a round are merged", merged, dumpEntries(c));
+				return true;
+			}
+		}
+		return false;
 	}
 };
 
@@ -2648,6 +2746,7 @@ struct MockRunner {
 		factories.push_back(&make<SelectionScenario>);
 		factories.push_back(&make<TrimScenario>);
 		factories.push_back(&make<ConfigScenario>);
+		factories.push_back(&make<FailLoopScenario>);
 		factories.push_back(&make<HistoryOrderScenario>);
 		factories.push_back(&make<UndoDuringRunScenario>);
 		factories.push_back(&make<PatchReplacedScenario>);

@@ -186,6 +186,10 @@ struct HttpLlmClient : LlmClient {
 		if (options.apiKey.empty() && !isLocalHost(host))
 			return makeError(LlmError::CONFIG, "No API key configured. Set RACK_ASSISTANT_API_KEY or OPENROUTER_API_KEY, or enter a key in the assistant settings.");
 
+		// Never send a key in cleartext to a remote host. Plain http is only accepted for local servers.
+		if (!options.apiKey.empty() && string::startsWith(string::lowercase(url), "http://") && !isLocalHost(host))
+			return makeError(LlmError::CONFIG, "Refusing to send the API key over plain http:// to a non-local host. Use an https:// base URL.");
+
 		// A key with line breaks or other control characters can't be sent in a header. Report it
 		// instead of silently sending the request without authentication.
 		for (char ch : options.apiKey) {

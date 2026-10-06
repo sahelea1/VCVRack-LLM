@@ -5,8 +5,9 @@ side panel; it can read and modify the current patch through tools (add/remove/m
 modules, set params, connect/disconnect cables, save) and explain/build patches.
 Backend: any OpenAI-compatible `POST {base_url}/chat/completions` endpoint.
 
-This document is the binding spec for the implementation. Names, signatures, JSON field
-names and behaviors below are normative unless marked "suggestion".
+**Status: this document reflects the implementation** (steps 1-3 plus review fixes). Where code and
+text disagree, the code in `include/assistant/` wins. User-facing usage, config table and
+troubleshooting live in [README.md](README.md); they are not repeated here.
 
 ---------------------------------------------------------------------------------------
 
@@ -44,13 +45,16 @@ include/assistant/
   Panel.hpp           docked chat panel public API (create/toggle/layout)
   SettingsDialog.hpp  settings dialog
   SelfTest.hpp        in-app self test (env RACK_ASSISTANT_SELFTEST)
+  PatchEvents.hpp     notifyPatchCleared() / getPatchGeneration() (see section 8)
 src/assistant/
   Config.cpp  Protocol.cpp  HttpLlmClient.cpp  MockLlmClient.cpp
   Tools.cpp (registry + arg helpers + registration)  PatchTools.cpp  CatalogTools.cpp
   Controller.cpp  SystemPrompt.cpp  Panel.cpp  SettingsDialog.cpp  SelfTest.cpp
+  ToolHelpers.hpp/.cpp  (private: JSON/ModuleRef/port+param resolution/grid/undo helpers for the tools)
+  UiCommon.hpp          (private: fonts, colors, text measuring shared by Panel + SettingsDialog)
 tests/assistant/
   test.hpp (tiny assertion framework)  test_main.cpp  test_protocol.cpp
-  test_config.cpp  test_mock.cpp  test_args.cpp  run_selftest.sh
+  test_config.cpp  test_mock.cpp  test_args.cpp  test_http.cpp  test_live.cpp  run_selftest.sh
 docs/assistant/ARCHITECTURE.md (this file), docs/assistant/README.md (user guide)
 ```
 
@@ -59,7 +63,9 @@ Touched existing files (minimal diffs):
   `step()` (shrinks `rackScroll`), Ctrl+L toggles it in `onHoverKey`, call
   `assistant::sceneStepHook()` (SelfTest.hpp) once per frame (self-test trigger).
 - `src/app/MenuBar.cpp` — new top-level "Assistant" menu.
-- `Makefile` — `test-assistant` target (Linux; builds `build/assistant_test` against libRack.so).
+- `src/patch.cpp` — `patch::Manager::clear()` calls `assistant::notifyPatchCleared()` (section 8).
+- `Makefile` — `test-assistant` target (Linux; builds `build/assistant_test` against libRack.so);
+  `RACK_VERSION` falls back to the newest `### 2.x.y` in CHANGELOG.md when there are no git tags.
 - `.gitignore` — `/assistant.json`, `/assistant-system-prompt.md`, `/assistant-mock.json`,
   `/assistant-selftest*` (dev mode puts the user dir in the repo root!).
 
@@ -243,7 +249,7 @@ std::string truncateUtf8(const std::string& s, size_t maxBytes);
 Request body:
 - `model`, `messages`; `tools` + `"tool_choice": "auto"` only if `toolsJson` non-empty.
 - Reasoning: `off` → no reasoning parameter at all (for non-reasoning models).
-  `none` → explicit effort "none" (required by OpenAI's own API for gpt-5.6-* when tools are
+  `none` → explicit effort "none" in the configured style (required by OpenAI's own API for gpt-5.6-* when tools are
   used on /v1/chat/completions: "Function tools with reasoning_effort are not supported …
   set reasoning_effort to 'none'"; OpenRouter accepts reasoning + tools). Otherwise style `openrouter` → `"reasoning": {"effort": E}`; style `openai` →
   `"reasoning_effort": E`.
@@ -262,8 +268,8 @@ Response parsing (robust):
 - `choices` missing/empty → `BAD_RESPONSE`. `choices[0].error` → error.
 - `message.content`: string → content; null/missing → `contentNull=true`; array → concat
   `text` of parts whose `type` is `text`/`output_text`.
-- `message.tool_calls`: each `{id, function:{name, arguments}}`; missing id → generate
-  `"call_<index>"`; `arguments` string kept verbatim, object/array → dumped compact,
+- `message.tool_calls`: each `{id, function:{name, arguments}}`; missing id → left empty
+  (the controller assigns `"call_<round>_<index>"`, unique across rounds); `arguments` string kept verbatim, object/array → dumped compact,
   missing → `"{}"`. Entries without a function name are kept with empty name (tool
   execution then reports the error). Legacy `message.function_call` → one tool call.
 - Reasoning: `message.reasoning` or `message.reasoning_content` (string) → `reasoning`;
@@ -275,11 +281,11 @@ Response parsing (robust):
 HTTP error mapping (`message` texts, English, user-facing):
 | status | kind | message |
 |---|---|---|
-| 400 | BAD_REQUEST | "The provider rejected the request (400): <detail>. Check model parameters (temperature, max_tokens, reasoning) in the assistant settings." |
+| 400 | BAD_REQUEST | "The provider rejected the request (400): <detail>. Check model parameters (temperature, max_tokens, reasoning) in the assistant settings." (if the detail says the model is invalid/not found: "... Check 'model' in the assistant settings.") |
 | 401 | AUTH | "Authentication failed (401). Check your API key (RACK_ASSISTANT_API_KEY / OPENROUTER_API_KEY or the assistant settings)." |
 | 402 | PAYMENT | "Insufficient credits (402). Top up your account or pick a cheaper model." |
 | 403 | FORBIDDEN | "Access denied (403): <detail>" |
-| 404 | NOT_FOUND | "Model or endpoint not found (404). Check 'model' and 'base_url' in the assistant settings." |
+| 404 | NOT_FOUND | "Model or endpoint not found (404)[: <detail>]. Check 'model' and 'base_url' in the assistant settings." |
 | 408 | TIMEOUT | "The provider timed out (408). Try again." |
 | 413 | BAD_REQUEST | "Request too large (413). Start a new chat to shorten the conversation." |
 | 429 | RATE_LIMIT | "Rate limited (429). Wait a moment and try again." |
@@ -328,6 +334,8 @@ init already done by `network::init()`):
 - Empty key and host is not localhost/127.0.0.1/[::1] → return CONFIG error
   "No API key configured. Set RACK_ASSISTANT_API_KEY or OPENROUTER_API_KEY, or enter a key in the assistant settings."
   (local servers like Ollama/LM Studio work without a key).
+- A non-empty key with a plain `http://` URL whose host is not local → CONFIG error "Refusing to send
+  the API key over plain http:// to a non-local host. Use an https:// base URL." (nothing is sent).
 - Transport errors: `CURLE_ABORTED_BY_CALLBACK` → CANCELLED "Cancelled.";
   `CURLE_OPERATION_TIMEDOUT` → TIMEOUT "The request timed out after N s.";
   resolve/connect errors → NETWORK "Could not connect to <host>: <curl error>.";
@@ -484,7 +492,8 @@ rightmost selected module; else right of the rightmost module in row 0; empty pa
 (0,0). Summary: "VCF added".
 
 **remove_module** `{module_id}` — destructive. Confirmation: "Remove module 'VCO'
-(Fundamental VCO, id 123) and its 2 cables?". Run: `mw->appendDisconnectActions(ctx.undo)`,
+(Fundamental, HP 10, row 0) and its 2 cables?" (plugin slug and grid position; module ids are
+long random numbers and mean nothing to the user). Run: `mw->appendDisconnectActions(ctx.undo)`,
 `history::ModuleRemove` (setModule before removal), `rack->removeModule(mw)`, `delete mw`,
 `rack->updateExpanders()`. → `{ok, removed_module_id, removed_cables}`. Summary: "VCO removed".
 
@@ -493,7 +502,7 @@ row, ignoring itself), `history::ModuleMove` (pixel old/new pos), `updateExpande
 → `{ok, module_id, pos, note?}`. Summary: "VCO moved to HP 24, row 1".
 
 **set_param** `{module_id, param_id: int|string, value?: number, display_value?: number}`
-(exactly one of value/display_value). Validates range; `ParamQuantity` required. old =
+(one of value/display_value; if both are sent, a 0 in one field is treated as a placeholder for the other, otherwise display_value wins, and the result carries a note; with both 0 the raw value is used and a note warns when raw 0 does not display as 0). Validates range; `ParamQuantity` required. old =
 `params[id].getValue()`; `pq->setImmediateValue(v)` or `pq->setDisplayValue(dv)` (clamps +
 snaps); new = `pq->getImmediateValue()`; push `history::ParamChange` if changed.
 → `{ok, module_id, param_id, name, old_value, value, display, min, max, clamped}`
@@ -514,8 +523,10 @@ before removal), `rack->removeCable(cw)`, `delete cw`. → `{ok, removed_cable_i
 Summary: "Disconnected VCO Saw → VCF Audio". Not destructive (undoable, spec).
 
 **save_patch** `{path?: string}` — empty → current `APP->patch->path` (untitled → error asking
-for a path). Relative → `asset::user("patches")/<path>` (create dirs); append ".vcv" if no
-extension. Confirmation only if the target exists and is not the current patch file:
+for a path). Only relative paths are accepted: absolute paths and any `..` component are rejected with an
+error; the file is stored under `asset::user("patches")/<path>` (dirs created); ".vcv" is
+appended unless the name already ends in .vcv. The deepest existing part of the target is canonicalized
+(symlinks resolved) and must stay under the canonical patches folder, otherwise the call fails. Confirmation only if the target exists and is not the current patch file:
 "Overwrite existing file <path>?". Run: `APP->patch->save(path)` (catch), `patch->path = path`,
 `patch->pushRecentPath(path)`, `ctx.savedDuringRun = true; ctx.mutationsSinceSave = 0`.
 → `{ok, path}`. Summary: "Saved my-acid.vcv".
@@ -571,7 +582,7 @@ Run lifecycle (UI thread):
    build user content = text + (if attachSelection and selection non-empty) a block
    `"\n\n[Selected modules]\n- id <id>: <plugin> <model> \"<name>\" at HP <hp>, row <row>\n..."`;
    append USER entry (text only + "(+N selected modules attached)") and USER message;
-   create `history::ComplexAction` named "assistant changes"; round = 0; start HTTP.
+   round = 0; record the patch generation; the undo action (`RunAction`) is created lazily by the first mutating call (see below); start HTTP.
 2. Start HTTP: request = [system message (prompt file + environment block: Rack version,
    installed plugins with model counts)] + conversation trimmed to `maxContextChars` (drop
    oldest whole turns; a turn starts at a USER message; always keep the latest turn) +
@@ -592,8 +603,32 @@ Run lifecycle (UI thread):
 6. Cancel: HTTP → retire worker, INFO "Cancelled."; tools/confirm → remaining tool calls
    get `{"ok":false,"error":"Cancelled by the user."}` results (keeps the API history valid),
    pending CONFIRM entries → CANCELLED; end run.
-7. End run: push the ComplexAction to `APP->history` if non-empty (else delete); if
-   `savedDuringRun && mutationsSinceSave == 0` → `APP->history->setSaved()`; state IDLE.
+7. End run: state IDLE, per-run bookkeeping reset, status line "Last run: N requests · tokens · $cost".
+   The run's changes are already in the history (see below), nothing is pushed here.
+- **Eager undo push.** The run's undo action is a `RunAction : history::ComplexAction` with a
+  `shared_ptr<bool> alive` flag that its destructor clears (the history may delete it any time).
+  The first tool call that changed something pushes it to `APP->history` immediately; later calls
+  append to it, so the whole run stays one undo step and Ctrl+Z works even while the run is still
+  going. Before every call and every frame the controller checks (`isTopAction`, using `alive`)
+  that the action is still the newest undo step with no redo stack; if the user edited, undid or
+  redid in the meantime, the action is dropped and the next mutation starts a new one (the run is
+  then split into several undo steps). Appending to an action sitting at the saved index clears
+  `savedIndex`, so the patch shows as modified.
+- `bool canUndoLastRun()` is true when idle, the last run pushed exactly one action, the patch
+  generation is unchanged and that action is still the top undo step. `void undoLastRun()` then
+  calls `APP->history->undo()` once. The panel shows an "Undo changes" button in the status row
+  while `canUndoLastRun()`.
+- **PatchEvents** (`PatchEvents.hpp`): `patch::Manager::clear()` (File > New/Open/Revert,
+  templates, autosave restore) calls `notifyPatchCleared()`, which bumps `getPatchGeneration()`.
+  A run records the generation at start; when it changes, `step()` cancels the run
+  ("Cancelled: the patch was replaced..."), forgets the action (the history deleted it) and
+  `confirm()` is ignored, so no stale tool call runs on the new patch.
+- Confirm auto-show: if the panel is hidden while the state is WAITING_CONFIRM with a pending
+  CONFIRM entry, the panel shows itself again (without taking keyboard focus) so the run cannot
+  stall unnoticed.
+- Reasoning `none` retry: if a response is a 400 whose text mentions `reasoning_effort` and
+  `none` (OpenAI direct with tools) and the effort was not already off/none, the run restarts once
+  with an effort override of `none` and an INFO entry tells the user to change the setting.
 - Worker: `struct PendingRequest { std::atomic<bool> cancel, done; ChatResponse response;
   std::thread thread; }` held by `std::shared_ptr`; thread name "Assistant"; catches all
   exceptions → OTHER error. Retired requests are joined once `done`.
@@ -664,13 +699,17 @@ so that the self test exists before the panel does.
 
 **SettingsDialog** (`ui::MenuOverlay` modal, Esc/click outside closes, centered panel ~560 px
 wide): rows label + field: Base URL, Model, Reasoning effort (ChoiceButton menu: off,
-minimal, low, medium, high), Parameter style (openrouter, openai), Max tokens (blank =
+none, minimal, low, medium, high), Parameter style (openrouter, openai), Max tokens (blank =
 unset), Temperature (blank = unset), API key (`ui::PasswordField`; blank keeps the stored
 key; info line shows source + masked key, e.g. "Using env OPENROUTER_API_KEY
 (sk-or-v1…abcd) — overrides the stored key"; "Clear stored key" button), Extra headers
 (multiline "Name: value" per line), Max tool rounds, Timeout (s), CA bundle, checkboxes
 Confirm destructive actions / Mock mode (no network). Buttons: Save (validates; errors in
 red; saves via `Controller::setConfig`), Cancel. Tab cycles fields (prevField/nextField).
+Key containment: every focusable widget consumes all key presses it does not handle (and Escape
+closes the dialog), so no shortcut of `Scene::onHoverKey` (undo, save, delete selection, ...)
+fires behind the modal. The API key field is a `PasswordField` that blocks Ctrl+C/Ctrl+X and has
+no context menu (the key cannot be copied out); the typed text is zeroed when the dialog closes.
 
 ## 11. Tests
 
@@ -682,7 +721,11 @@ red; saves via `Controller::setConfig`), Cancel. Tab cycles fields (prevField/ne
   function_call, reasoning fields, usage, 200-with-error, missing choices, invalid JSON,
   each HTTP status class), config (defaults, type-checked parsing, invalid values, extra
   headers CR/LF, save/load roundtrip + 0600, key precedence via setenv/unsetenv, masking),
-  arg helpers, mock client scenarios (no APP needed).
+  arg helpers, mock client scenarios (no APP needed). `test_http.cpp` runs `HttpLlmClient` against
+  an in-process fake server on 127.0.0.1 (request shape, no auth header for localhost, status
+  mapping, invalid JSON, cancel/timeout/refused, missing or malformed key). `test_live.cpp` holds
+  opt-in tests against a real provider (`--live`, env `RACK_ASSISTANT_*`, see README); they never
+  print keys or bodies. `make test-assistant ASSISTANT_TEST_ARGS="--live --filter x"`.
 - In-app self test: `RACK_ASSISTANT_SELFTEST=tools|mock|all ./Rack -d -u <tmp>` (script
   `tests/assistant/run_selftest.sh` creates a temp user dir with a `plugins` symlink, runs
   under Xvfb if no display). Runs on the UI thread after ~30 frames: tools scenario against
@@ -719,3 +762,5 @@ red; saves via `Controller::setConfig`), Cancel. Tab cycles fields (prevField/ne
 9. Extra effort value `none` (verified live): OpenAI direct + tools needs it. The controller
    retries a run once with `none` when a 400 says reasoning_effort is unsupported with tools,
    and tells the user to change the setting.
+10. The undo action is pushed eagerly and re-validated each frame (section 8) instead of once at
+    the end of the run, so edits made during a run cannot corrupt the history.

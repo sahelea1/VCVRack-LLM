@@ -30,6 +30,9 @@ struct ChatEntry {
 		std::string text;
 		bool ok = true;
 		bool readOnly = false;
+		/** Text without the repeat suffix; identical consecutive actions are merged ("text ×3"). */
+		std::string key;
+		int repeat = 1;
 	};
 	enum ConfirmState {
 		PENDING,
