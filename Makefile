@@ -1,7 +1,11 @@
 RACK_DIR ?= .
 RACK_EDITION := Free
 RACK_VERSION_MAJOR := 2
-RACK_VERSION ?= $(patsubst v%,%,$(shell git describe --tags --match "v$(RACK_VERSION_MAJOR).*"))
+RACK_VERSION ?= $(patsubst v%,%,$(shell git describe --tags --match "v$(RACK_VERSION_MAJOR).*" 2>/dev/null))
+# Fall back to the newest version in CHANGELOG.md when the checkout has no version tags (e.g. forks). Without a version, Core fails to load.
+ifeq ($(RACK_VERSION),)
+	RACK_VERSION := $(shell sed -n 's/^\#\#\# \($(RACK_VERSION_MAJOR)\.[0-9][0-9.]*\).*/\1/p' CHANGELOG.md | head -n 1)
+endif
 
 FLAGS += -Iinclude -Idep/include
 
@@ -103,6 +107,23 @@ STANDALONE_OBJECTS += $(TARGET)
 
 $(STANDALONE_TARGET): $(STANDALONE_SOURCES) $(STANDALONE_OBJECTS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(STANDALONE_LDFLAGS)
+
+# Assistant unit tests (Linux only, links against libRack.so; `make test-assistant`)
+
+ifdef ARCH_LIN
+ASSISTANT_TEST_SOURCES := $(wildcard tests/assistant/*.cpp)
+ASSISTANT_TEST_OBJECTS := $(patsubst %, build/%.o, $(ASSISTANT_TEST_SOURCES))
+ASSISTANT_TEST_LDFLAGS := -L. -lRack -Wl,-rpath,'$$ORIGIN/..' -static-libstdc++ -static-libgcc -lpthread
+
+-include $(patsubst %, build/%.d, $(ASSISTANT_TEST_SOURCES))
+
+build/assistant_test: $(ASSISTANT_TEST_OBJECTS) $(TARGET)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $(ASSISTANT_TEST_OBJECTS) $(ASSISTANT_TEST_LDFLAGS)
+
+test-assistant: build/assistant_test
+	./build/assistant_test $(ASSISTANT_TEST_ARGS)
+endif
 
 # Convenience targets
 
@@ -320,4 +341,4 @@ cleandist:
 
 
 .DEFAULT_GOAL := all
-.PHONY: all dep run debug clean plugins dist sdk package lipo notarize
+.PHONY: all dep run debug clean plugins dist sdk package lipo notarize test-assistant

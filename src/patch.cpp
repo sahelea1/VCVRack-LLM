@@ -14,6 +14,7 @@
 #include <history.hpp>
 #include <settings.hpp>
 #include <plugin.hpp>
+#include <assistant/PatchEvents.hpp>
 
 
 namespace rack {
@@ -91,6 +92,7 @@ void Manager::launch(std::string pathArg) {
 
 
 void Manager::clear() {
+	assistant::notifyPatchCleared();
 	path = "";
 	if (APP->scene) {
 		APP->scene->rack->clear();

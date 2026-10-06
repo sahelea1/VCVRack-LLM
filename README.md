@@ -11,6 +11,14 @@
 - [Communities](https://vcvrack.com/manual/Communities)
 - [Licenses](LICENSE.md) ([HTML](LICENSE.html))
 
+## This fork: built-in AI assistant
+
+This fork adds a chat panel (Ctrl+L) where an LLM can inspect and edit your patch: search installed
+modules, add and connect them, set parameters and save, with every run undoable in one step.
+It works with OpenRouter, OpenAI or a local OpenAI-compatible server, and has an offline mock mode.
+Patch data and messages are sent to the provider you configure. Setup, API keys and troubleshooting:
+[docs/assistant/README.md](docs/assistant/README.md).
+
 ## Acknowledgments
 
 - [Andrew Belt](https://github.com/AndrewBelt): Lead Rack developer

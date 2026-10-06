@@ -27,3 +27,10 @@
 /settings.json
 /screenshots
 /selections
+
+# Assistant files (dev mode puts the user dir in the repo root)
+/assistant.json
+/assistant.json.tmp
+/assistant-system-prompt.md
+/assistant-mock.json
+/assistant-selftest*
