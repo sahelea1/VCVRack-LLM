@@ -389,7 +389,11 @@ bool resolveParam(const ModuleRef& m, json_t* idJ, int* out, std::string* err) {
 
 
 std::string displayString(engine::ParamQuantity* pq) {
-	return pq->getDisplayValueString() + pq->getUnit();
+	std::string s = pq->getDisplayValueString();
+	// Momentary buttons and unlabeled switch positions display as an empty string
+	if (s.empty())
+		return string::f("%g", pq->getValue());
+	return s + pq->getUnit();
 }
 
 
